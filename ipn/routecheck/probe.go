@@ -48,9 +48,25 @@ func (c *Client) probe(ctx context.Context, nodes iter.Seq[probed], limit int, t
 
 	var mu syncs.Mutex
 	r := &Report{}
+
+	timestampProbe := func(n probed) {
+		mu.Lock()
+		defer mu.Unlock()
+		mak.Set(&r.LastProbed, n.id, time.Now())
+	}
+
 	for n := range nodes {
 		g.Go(func() error {
 			metricPing.Add(1)
+
+			// We record the timestamp of each node’s latest probe
+			// so we can probe in incremental batches
+			// and to limit the rate that any given node is pinged.
+			//
+			// TODO(sfllaw): We currently record the timestamp
+			// but haven’t implemented batching or rate-limiting yet.
+			defer timestampProbe(n)
+
 			// TODO(sfllaw): Why did we choose Disco ping instead of TSMP ping?
 			// After all, a TSMP ping proves that the peer Tailscale node is there
 			// and that both nodes know each other’s WireGuard keys,
@@ -68,6 +84,7 @@ func (c *Client) probe(ctx context.Context, nodes iter.Seq[probed], limit int, t
 			// using a random ephemeral_private key and not record any state.
 			// See https://www.wireguard.com/protocol/ and tailscale/tailscale#19670.
 			pong, err := c.ping(ctx, n.addr, tailcfg.PingDisco, timeout)
+
 			if err != nil {
 				// Returning an error would cancel the errgroup.
 				if err != context.DeadlineExceeded {
