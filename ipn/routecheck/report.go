@@ -15,6 +15,7 @@ import (
 
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/mak"
 )
 
 var (
@@ -51,6 +52,24 @@ type Report struct {
 	// This is used to rate-limit reachability probing, so an entry’s
 	// presence doesn’t imply that it is reachable.
 	LastProbed map[tailcfg.NodeID]time.Time
+}
+
+// RoutablePrefixes returns a [RoutingTable] mapping routable network prefixes
+// with the associated routers that were reachable by the current host,
+// at the time the report was finished.
+//
+// Note: Fallback routes are not supported by design. If a subnet prefix
+// contained within another more general prefix has no reachable routers,
+// traffic is still sent to one of those unreachable routers.
+// Routers for the general prefix aren’t candidates. See tailscale/tailscale#18550.
+func (rp Report) RoutablePrefixes() RoutingTable {
+	var out map[netip.Prefix][]Node
+	for _, n := range rp.Reachable {
+		for _, p := range n.Routes {
+			mak.Set(&out, p, append(out[p], n))
+		}
+	}
+	return out
 }
 
 // Node represents a node in the reachability report.
@@ -94,3 +113,6 @@ func (ns nodeset) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	}
 	return nil
 }
+
+// RoutingTable is a map of routers, keyed by the network prefix for which they route.
+type RoutingTable map[netip.Prefix][]Node
