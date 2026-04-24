@@ -8,10 +8,12 @@
 package routecheck
 
 import (
+	"context"
 	"fmt"
 
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/ipn/routecheck"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 )
@@ -48,6 +50,10 @@ func (e *Extension) Name() string {
 
 // Init implements the [ipnext.Extension.Init] interface method.
 func (e *Extension) Init(h ipnext.Host) error {
+	if routecheck.DebugClientSideReachabilityRoutecheck().EqualBool(false) {
+		return ipnext.SkipExtension
+	}
+
 	e.nb = nodeBackender{h}
 
 	nm, ok := e.backend.(routecheck.NetMapper)
@@ -65,12 +71,16 @@ func (e *Extension) Init(h ipnext.Host) error {
 	e.Client = c
 
 	h.Hooks().OnNetMapToggle.Add(e.onNetMapToggle)
+	h.Hooks().OnPeersReceived.Add(e.onPeersReceived)
+	h.Hooks().OnSelfChange.Add(e.onSelfChange)
 
+	go e.Client.Start(context.Background())
 	return nil
 }
 
 // Shutdown implements the [ipnext.Extension.Shutdown] interface method.
 func (e *Extension) Shutdown() error {
+	e.Client.Close()
 	return nil
 }
 
@@ -78,4 +88,19 @@ func (e *Extension) onNetMapToggle(nm *netmap.NetworkMap) {
 	if nm := e.nm.NetMap(); nm != nil {
 		e.Client.NetMapAvailable(nm)
 	}
+}
+
+func (e *Extension) onPeersReceived(peers []tailcfg.NodeView) {
+	e.needsRefresh()
+}
+
+func (e *Extension) onSelfChange(self tailcfg.NodeView) {
+	e.needsRefresh()
+}
+
+func (e *Extension) needsRefresh() {
+	if !routecheck.IsEnabled(e.nb.NodeBackend().Self()) {
+		return
+	}
+	e.Client.NeedsRefresh()
 }

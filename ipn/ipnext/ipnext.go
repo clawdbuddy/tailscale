@@ -382,6 +382,10 @@ type Hooks struct {
 	// or when the client disconnects and the network map is cleared.
 	OnNetMapToggle feature.Hooks[func(*netmap.NetworkMap)]
 
+	// OnPeersReceived is called (with LocalBackend.mu held) when a peer map has been received,
+	// whether or not it changed.
+	OnPeersReceived feature.Hooks[func([]tailcfg.NodeView)]
+
 	// OnSelfChange is called (with LocalBackend.mu held) when the self node
 	// changes, including changing to nothing (an invalid view).
 	OnSelfChange feature.Hooks[func(tailcfg.NodeView)]

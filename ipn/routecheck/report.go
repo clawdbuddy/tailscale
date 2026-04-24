@@ -4,7 +4,6 @@
 package routecheck
 
 import (
-	"context"
 	"maps"
 	"net/netip"
 	"slices"
@@ -26,17 +25,7 @@ var (
 // Returns nil if a report isn’t available, which happens during initialization.
 func (c *Client) Report() *Report {
 	metricReport.Add(1)
-	nm := c.nm.NetMap()
-	if nm == nil {
-		return nil // The report wasn’t available.
-	}
-
-	// TODO(sfllaw): Return the latest snapshot produced by background probing.
-	r, err := c.Refresh(context.TODO(), DefaultTimeout)
-	if err != nil {
-		c.logf("%v", err)
-	}
-	return r
+	return c.report.Load()
 }
 
 // Report contains the result of a single routecheck.
