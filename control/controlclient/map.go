@@ -393,11 +393,45 @@ func (ms *mapSession) tryHandleIncrementally(res *tailcfg.MapResponse) bool {
 	if !ok {
 		return false
 	}
+	// If the response carries a new packet filter, the updater must
+	// support pushing it narrowly; otherwise fall back to a full netmap
+	// rebuild. PacketFilter/PacketFilters are no longer in
+	// mapResponseContainsNonPatchFields, so MutationsFromMapResponse will
+	// happily return mutations alongside a filter change — we need to
+	// deliver the filter separately before those mutations land.
+	if res.PacketFilter != nil || res.PacketFilters != nil {
+		pfu, ok := ms.netmapUpdater.(PacketFilterUpdater)
+		if !ok {
+			return false
+		}
+		pfu.UpdatePacketFilter(ms.lastPacketFilterRules, ms.lastParsedPacketFilter)
+	}
+	// Same shape for UserProfiles: deliver any new/updated profiles before
+	// the peer mutations that may reference them, so bus consumers never
+	// see a UserID for which a profile hasn't been published. The values
+	// are read from ms.lastUserProfile (just populated by
+	// updateStateFromResponse) so views are shared with mapSession's
+	// store; downstream consumers can use [UserProfileView.Equal] for
+	// dedup without copying.
+	if len(res.UserProfiles) > 0 {
+		upu, ok := ms.netmapUpdater.(UserProfileUpdater)
+		if !ok {
+			return false
+		}
+		profiles := make(map[tailcfg.UserID]tailcfg.UserProfileView, len(res.UserProfiles))
+		for _, up := range res.UserProfiles {
+			profiles[up.ID] = ms.lastUserProfile[up.ID]
+		}
+		upu.UpdateUserProfiles(profiles)
+	}
 	mutations, ok := netmap.MutationsFromMapResponse(res, time.Now())
-	if ok && len(mutations) > 0 {
+	if !ok {
+		return false
+	}
+	if len(mutations) > 0 {
 		return nud.UpdateNetmapDelta(mutations)
 	}
-	return ok
+	return true
 }
 
 // updateStats are some stats from updateStateFromResponse, primarily for

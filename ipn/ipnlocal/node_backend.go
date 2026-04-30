@@ -572,10 +572,37 @@ func (nb *nodeBackend) updatePeersLocked() {
 	}
 }
 
+// setPacketFilter updates the netmap's packet filter rules and parsed
+// form in place. nb.mu is acquired by this method.
+func (nb *nodeBackend) setPacketFilter(rules views.Slice[tailcfg.FilterRule], parsed []filter.Match) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if nb.netMap == nil {
+		return
+	}
+	nb.netMap.PacketFilterRules = rules
+	nb.netMap.PacketFilter = parsed
+}
+
+// mergeUserProfiles merges new/updated [tailcfg.UserProfileView]
+// entries into the current netmap's UserProfiles map. Callers must hold
+// [LocalBackend.mu]. nb.mu is acquired by this method. The views share backing
+// memory with the caller; they are stored as-is.
+func (nb *nodeBackend) mergeUserProfiles(profiles map[tailcfg.UserID]tailcfg.UserProfileView) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if nb.netMap == nil {
+		return
+	}
+	for id, up := range profiles {
+		mak.Set(&nb.netMap.UserProfiles, id, up)
+	}
+}
+
 func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bool) {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
-	if nb.netMap == nil || len(nb.peers) == 0 {
+	if nb.netMap == nil {
 		return false
 	}
 
@@ -585,9 +612,35 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	var mutableNodes map[tailcfg.NodeID]*tailcfg.Node
 
 	for _, m := range muts {
-		n, ok := mutableNodes[m.NodeIDBeingMutated()]
+		switch m := m.(type) {
+		case netmap.NodeMutationAdd:
+			nid := m.Node.ID()
+			mak.Set(&nb.peers, nid, m.Node)
+			for _, ipp := range m.Node.Addresses().All() {
+				if ipp.IsSingleIP() {
+					mak.Set(&nb.nodeByAddr, ipp.Addr(), nid)
+				}
+			}
+			mak.Set(&nb.nodeByKey, m.Node.Key(), nid)
+			continue
+		case netmap.NodeMutationRemove:
+			nid := m.NodeIDBeingMutated()
+			if old, ok := nb.peers[nid]; ok {
+				for _, ipp := range old.Addresses().All() {
+					if ipp.IsSingleIP() {
+						delete(nb.nodeByAddr, ipp.Addr())
+					}
+				}
+				delete(nb.nodeByKey, old.Key())
+				delete(nb.peers, nid)
+			}
+			continue
+		}
+		// Per-field mutation.
+		nid := m.NodeIDBeingMutated()
+		n, ok := mutableNodes[nid]
 		if !ok {
-			nv, ok := nb.peers[m.NodeIDBeingMutated()]
+			nv, ok := nb.peers[nid]
 			if !ok {
 				// TODO(bradfitz): unexpected metric?
 				return false
@@ -600,6 +653,7 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	for nid, n := range mutableNodes {
 		nb.peers[nid] = n.View()
 	}
+	nb.signalKeyWaitersForTestLocked()
 	return true
 }
 
