@@ -628,7 +628,7 @@ func (e *serveEnv) runServeStatus(ctx context.Context, args []string) error {
 		return nil
 	}
 	printFunnelStatus(ctx)
-	if sc == nil || (len(sc.TCP) == 0 && len(sc.Web) == 0 && len(sc.AllowFunnel) == 0) {
+	if isServeConfigEmpty(sc) {
 		printf("No serve config\n")
 		return nil
 	}
@@ -636,18 +636,8 @@ func (e *serveEnv) runServeStatus(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if sc.IsTCPForwardingAny() {
-		if err := printTCPStatusTree(ctx, sc, st); err != nil {
-			return err
-		}
-		printf("\n")
-	}
-	for hp := range sc.Web {
-		err := e.printWebStatusTree(sc, hp)
-		if err != nil {
-			return err
-		}
-		printf("\n")
+	if err := printServeStatusTrees(sc, st); err != nil {
+		return err
 	}
 	printFunnelWarning(sc)
 	return nil
@@ -678,7 +668,7 @@ func printTCPStatusTree(ctx context.Context, sc *ipn.ServeConfig, st *ipnstate.S
 	return nil
 }
 
-func (e *serveEnv) printWebStatusTree(sc *ipn.ServeConfig, hp ipn.HostPort) error {
+func printWebStatusTree(sc *ipn.ServeConfig, hp ipn.HostPort) error {
 	// No-op if no serve config
 	if sc == nil {
 		return nil
@@ -709,17 +699,6 @@ func (e *serveEnv) printWebStatusTree(sc *ipn.ServeConfig, hp ipn.HostPort) erro
 		printf("%s://%s%s (%s)\n", scheme, hostname, portPart, fStatus)
 	}
 	printf("%s://%s%s (%s)\n", scheme, host, portPart, fStatus)
-	srvTypeAndDesc := func(h *ipn.HTTPHandler) (string, string) {
-		switch {
-		case h.Path != "":
-			return "path", h.Path
-		case h.Proxy != "":
-			return "proxy", h.Proxy
-		case h.Text != "":
-			return "text", "\"" + elipticallyTruncate(h.Text, 20) + "\""
-		}
-		return "", ""
-	}
 
 	mounts := slicesx.MapKeys(sc.Web[hp].Handlers)
 	sort.Slice(mounts, func(i, j int) bool {
@@ -729,7 +708,7 @@ func (e *serveEnv) printWebStatusTree(sc *ipn.ServeConfig, hp ipn.HostPort) erro
 
 	for _, m := range mounts {
 		h := sc.Web[hp].Handlers[m]
-		t, d := srvTypeAndDesc(h)
+		t, d := serveHandlerDesc(h)
 		printf("%s %s%s %-5s %s\n", "|--", m, strings.Repeat(" ", maxLen-len(m)), t, d)
 	}
 
