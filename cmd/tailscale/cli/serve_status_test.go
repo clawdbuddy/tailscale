@@ -35,7 +35,7 @@ func TestPrintServeStatusTrees(t *testing.T) {
 		notWant []string // substrings that must NOT appear
 	}{
 		{
-			name: "node web tailnet only",
+			name: "node_web_tailnet_only",
 			sc: &ipn.ServeConfig{
 				TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
 				Web: map[ipn.HostPort]*ipn.WebServerConfig{
@@ -53,7 +53,7 @@ func TestPrintServeStatusTrees(t *testing.T) {
 			notWant: []string{"Service ", "Funnel on"},
 		},
 		{
-			name: "node tcp funnel on",
+			name: "node_tcp_funnel_on",
 			sc: &ipn.ServeConfig{
 				TCP: map[uint16]*ipn.TCPPortHandler{2222: {TCPForward: "127.0.0.1:22"}},
 				AllowFunnel: map[ipn.HostPort]bool{
@@ -69,7 +69,7 @@ func TestPrintServeStatusTrees(t *testing.T) {
 			notWant: []string{"Service ", "tailnet only"},
 		},
 		{
-			name: "service web only",
+			name: "service_web_only",
 			sc: &ipn.ServeConfig{
 				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
 					"svc:db": {
@@ -90,7 +90,7 @@ func TestPrintServeStatusTrees(t *testing.T) {
 			notWant: []string{"Funnel on", "Service svc:"},
 		},
 		{
-			name: "service tcp forward",
+			name: "service_tcp_forward",
 			sc: &ipn.ServeConfig{
 				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
 					"svc:ssh": {
@@ -105,7 +105,7 @@ func TestPrintServeStatusTrees(t *testing.T) {
 			notWant: []string{"Service svc:"},
 		},
 		{
-			name: "service tun",
+			name: "service_tun",
 			sc: &ipn.ServeConfig{
 				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
 					"svc:vpn": {Tun: true},
@@ -117,7 +117,7 @@ func TestPrintServeStatusTrees(t *testing.T) {
 			notWant: []string{"https://", "tcp://", "Funnel on", "Service svc:"},
 		},
 		{
-			name: "node and services mixed",
+			name: "node_and_services_mixed",
 			sc: &ipn.ServeConfig{
 				TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
 				Web: map[ipn.HostPort]*ipn.WebServerConfig{
