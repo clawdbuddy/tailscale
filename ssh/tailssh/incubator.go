@@ -529,6 +529,25 @@ func tryExecLogin(dlogf logger.Logf, ia incubatorArgs) error {
 			// breaks things like mosh and VSCode.
 			return nil
 		}
+	case darwin:
+		// macOS's /usr/bin/login does not propagate the child command's
+		// exit status back to its caller when invoked without a controlling
+		// terminal (i.e. with -pq for a non-TTY exec session). Concretely,
+		// `ssh mac exit 42` returns 0 instead of 42 because login itself
+		// exits 0 once it has spawned the command.
+		//
+		// For interactive shells (hasTTY), exit-code propagation is not
+		// observable to the user and login still gives us the desired PAM
+		// "remote" session and utmpx accounting, so we keep the login path.
+		// For non-TTY exec sessions we skip login and fall through to
+		// handleSSHInProcess, which uses cmd.Run + os.Exit(code) and so
+		// yields the correct exit status.
+		//
+		// Tracked in tailscale/tailscale#18256.
+		if !ia.hasTTY && !ia.isShell {
+			dlogf("skipping login on darwin: non-TTY command exec swallows child exit status")
+			return nil
+		}
 	}
 
 	loginCmdPath, err := exec.LookPath("login")
