@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/connreject"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/packet"
 	"tailscale.com/tailcfg"
@@ -141,4 +142,14 @@ type Engine interface {
 	// SetPeerByIPPacketFunc installs a callback used by wireguard-go to
 	// look up which peer should handle an outbound packet by destination IP.
 	SetPeerByIPPacketFunc(func(netip.Addr) (_ key.NodePublic, ok bool))
+
+	// SetConnRejectNote installs a callback invoked when the engine
+	// observes an outbound-direction connection rejection (an inbound
+	// TSMP reject from a peer or a pendopen timeout). Passing nil
+	// uninstalls a previously installed callback.
+	//
+	// The callback is invoked synchronously on the data-plane
+	// goroutine; implementations should treat it as if it were a
+	// metric-emit callback and return promptly.
+	SetConnRejectNote(func(connreject.Event))
 }

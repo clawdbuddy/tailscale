@@ -25,6 +25,7 @@ import (
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store/mem"
+	"tailscale.com/net/connreject"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
@@ -1939,6 +1940,8 @@ func (e *mockEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size int, cb
 func (e *mockEngine) InstallCaptureHook(packet.CaptureCallback) {}
 
 func (e *mockEngine) SetPeerByIPPacketFunc(func(netip.Addr) (_ key.NodePublic, ok bool)) {}
+
+func (e *mockEngine) SetConnRejectNote(func(connreject.Event)) {}
 
 func (e *mockEngine) Close() {
 	e.mu.Lock()

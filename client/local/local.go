@@ -34,6 +34,7 @@ import (
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/connreject"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/udprelay/status"
 	"tailscale.com/paths"
@@ -449,6 +450,23 @@ func (lc *Client) EventBusGraph(ctx context.Context) ([]byte, error) {
 // EventBusQueues returns a JSON snapshot of event bus queue depths per client.
 func (lc *Client) EventBusQueues(ctx context.Context) ([]byte, error) {
 	return lc.get200(ctx, "/localapi/v0/debug-bus-queues")
+}
+
+// DebugRejects returns the node's aggregated connection-rejection
+// diagnostics. The feature is gated at runtime by
+// [tailcfg.NodeAttrConnReject]; when that attribute is not set on the
+// node, the response is returned with Enabled=false and empty
+// Outgoing/Incoming slices.
+func (lc *Client) DebugRejects(ctx context.Context) (*connreject.DebugRejectsResponse, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/debug-rejects")
+	if err != nil {
+		return nil, err
+	}
+	resp, err := decodeJSON[connreject.DebugRejectsResponse](body)
+	if err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
 // StreamBusEvents returns an iterator of Tailscale bus events as they arrive.

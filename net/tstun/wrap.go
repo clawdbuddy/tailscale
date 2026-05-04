@@ -26,6 +26,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
+	"tailscale.com/net/connreject"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/packet/checksum"
 	"tailscale.com/net/tsaddr"
@@ -223,6 +224,14 @@ type Wrapper struct {
 	eventClient              *eventbus.Client
 	discoKeyAdvertisementPub *eventbus.Publisher[events.DiscoKeyAdvertisement]
 
+	// connRejectNote is an optional callback invoked when this Wrapper
+	// emits a TSMP reject. It is nil until [SetConnRejectNote] is called
+	// (typically by the connreject feature extension at startup).
+	//
+	// Stored as an atomic so it can be installed safely after the
+	// Wrapper is in use; once set, callers do not change it again.
+	connRejectNote atomic.Pointer[func(connreject.Event)]
+
 	// tunDevStatsCloser closes TUN device stats polling. It may be nil if
 	// [HookPollTUNDevStats] is unset, or the hook func returned an error.
 	tunDevStatsCloser io.Closer
@@ -345,6 +354,21 @@ func (t *Wrapper) now() time.Time {
 // stack(s) get confused; see Issue 1526.
 func (t *Wrapper) SetDiscoKey(k key.DiscoPublic) {
 	t.discoKey.Store(k)
+}
+
+// SetConnRejectNote installs a callback that is invoked when the Wrapper
+// emits an outbound TSMP reject for an inbound peer connection that was
+// dropped by the packet filter. The callback receives a fully populated
+// [connreject.Event] of [connreject.Incoming] direction.
+//
+// SetConnRejectNote may be called at most once. A nil fn unsets any
+// previously installed callback.
+func (t *Wrapper) SetConnRejectNote(fn func(connreject.Event)) {
+	if fn == nil {
+		t.connRejectNote.Store(nil)
+		return
+	}
+	t.connRejectNote.Store(&fn)
 }
 
 // isSelfDisco reports whether packet p
@@ -1238,6 +1262,21 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook pa
 			t.InjectOutbound(pkt)
 
 			// TODO(bradfitz): also send a TCP RST, after the TSMP message.
+
+			if fnp := t.connRejectNote.Load(); fnp != nil {
+				reason := connreject.ReasonACL
+				if rj.Reason == packet.RejectedDueToShieldsUp {
+					reason = connreject.ReasonShields
+				}
+				(*fnp)(connreject.Event{
+					Direction: connreject.Incoming,
+					Proto:     rj.Proto,
+					Src:       rj.Src,
+					Dst:       rj.Dst,
+					Reason:    reason,
+					Source:    connreject.SourceTSMPSent,
+				})
+			}
 		}
 
 		return filter.Drop, gro

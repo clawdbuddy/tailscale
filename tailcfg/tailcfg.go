@@ -185,7 +185,8 @@ type CapabilityVersion int
 //   - 136: 2026-04-09: Client understands [NodeAttrDisableLinuxCGNATDropRule]
 //   - 137: 2026-04-15: Client handles 429 responses to /machine/register.
 //   - 138: 2026-03-31: can handle C2N /debug/tka.
-const CurrentCapabilityVersion CapabilityVersion = 138
+//   - 139: 2026-04-24: Client understands [NodeAttrConnReject]; can handle C2N /debug/rejects.
+const CurrentCapabilityVersion CapabilityVersion = 139
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -2546,6 +2547,15 @@ const (
 	// NodeAttrDebugForceBackgroundSTUN forces a node to always do background
 	// STUN queries regardless of inactivity.
 	NodeAttrDebugForceBackgroundSTUN NodeCapability = "debug-always-stun"
+
+	// NodeAttrConnReject enables the node's aggregated connection-rejection
+	// diagnostic buffers (ACL blocks, TSMP rejects, pendopen timeouts) and
+	// makes them available via the debug-rejects LocalAPI endpoint and the
+	// GET /debug/rejects c2n endpoint.
+	//
+	// This attribute may be removed in a future release once the feature
+	// is enabled by default.
+	NodeAttrConnReject NodeCapability = "debug-conn-reject"
 
 	// NodeAttrDebugDisableWGTrim disables the lazy WireGuard configuration,
 	// always giving WireGuard the full netmap, even for idle peers.

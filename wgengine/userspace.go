@@ -28,6 +28,7 @@ import (
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/connreject"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/ipset"
@@ -76,6 +77,13 @@ type userspaceEngine struct {
 	// eventBus will eventually become required, but for now may be nil.
 	eventBus    *eventbus.Bus
 	eventClient *eventbus.Client
+
+	// connRejectNote is an optional callback invoked when the engine
+	// observes an outbound-direction rejection (an inbound TSMP reject
+	// from a peer or a pendopen timeout). Installed via
+	// [SetConnRejectNote], typically by the connreject feature
+	// extension at startup.
+	connRejectNote atomic.Pointer[func(connreject.Event)]
 
 	linkChangeQueue execqueue.ExecQueue
 
@@ -1660,6 +1668,21 @@ func (e *userspaceEngine) InstallCaptureHook(cb packet.CaptureCallback) {
 	}
 	e.tundev.InstallCaptureHook(cb)
 	e.magicConn.InstallCaptureHook(cb)
+}
+
+// SetConnRejectNote installs a callback invoked when the engine
+// observes an outbound-direction connection rejection (an inbound TSMP
+// reject from a peer or a pendopen timeout). Passing nil uninstalls a
+// previously installed callback.
+//
+// SetConnRejectNote is typically called once at startup by the
+// [tailscale.com/feature/connreject] extension.
+func (e *userspaceEngine) SetConnRejectNote(fn func(connreject.Event)) {
+	if fn == nil {
+		e.connRejectNote.Store(nil)
+		return
+	}
+	e.connRejectNote.Store(&fn)
 }
 
 func (e *userspaceEngine) reconfigureVPNIfNecessary() error {

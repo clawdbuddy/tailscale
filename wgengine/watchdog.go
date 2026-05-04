@@ -17,6 +17,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/connreject"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/packet"
 	"tailscale.com/tailcfg"
@@ -241,6 +242,10 @@ func (e *watchdogEngine) InstallCaptureHook(cb packet.CaptureCallback) {
 		return
 	}
 	e.wrap.InstallCaptureHook(cb)
+}
+
+func (e *watchdogEngine) SetConnRejectNote(fn func(connreject.Event)) {
+	e.wrap.SetConnRejectNote(fn)
 }
 
 func (e *watchdogEngine) PeerByKey(pubKey key.NodePublic) (_ wgint.Peer, ok bool) {
