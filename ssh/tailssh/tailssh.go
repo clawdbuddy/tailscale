@@ -1079,15 +1079,29 @@ func (ss *sshSession) run() {
 	go ss.killProcessOnContextDone()
 
 	// Start goroutines to copy stdin/stdout/stderr.
+	//
+	// Only the output-side (stdout, stderr) goroutines participate in
+	// wg: we need to wait for the stdout copier to finish so it can
+	// call ss.CloseWrite() (sending SSH_MSG_CHANNEL_EOF) before
+	// SSH_MSG_CHANNEL_CLOSE is sent by the deferred ss.Close().
+	//
+	// The stdin copier is intentionally NOT in wg. It blocks reading
+	// from the SSH channel (ss) waiting for the client to half-close
+	// its write side, and many clients (e.g. bramvdbogaerde/go-scp,
+	// non-SFTP exec sessions) never do so before they themselves are
+	// waiting on the server-side close. Including it in wg.Wait()
+	// would deadlock: server waits for stdin to drain, client waits
+	// for server's CHANNEL_CLOSE. The stdin goroutine self-cleans
+	// when defer ss.Close() runs at function return.
 	var wg sync.WaitGroup
 
-	wg.Go(func() {
+	go func() {
 		defer ss.wrStdin.Close()
 		if _, err := io.Copy(rec.writer("i", ss.wrStdin), ss); err != nil {
 			logf("stdin copy: %v", err)
 			ss.cancelCtx(err)
 		}
-	})
+	}()
 
 	wg.Go(func() {
 		defer ss.rdStdout.Close()
