@@ -6,11 +6,17 @@
 package localapi
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"tailscale.com/feature"
 )
 
 func (h *Handler) serveRouteCheck(w http.ResponseWriter, r *http.Request) {
 	panic(feature.ErrUnavailable.Error())
+}
+
+func (h *Handler) routeCheckProbe(ctx context.Context, timeout time.Duration) error {
+	return nil
 }

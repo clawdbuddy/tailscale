@@ -1673,10 +1673,26 @@ func (h *Handler) serveSuggestExitNode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotImplemented)
 		return
 	}
-	if r.Method != httpm.GET {
-		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
+
+	switch r.Method {
+	case httpm.GET:
+		// The GET method is inappropriate because it isn’t cacheable.
+		// However, we retain it for backwards compatibility.
+	case httpm.POST:
+		if !defBool(r.FormValue("probe"), false) {
+			break
+		}
+		timeout := defDuration(r.FormValue("timeout"), 0)
+		if err := h.routeCheckRefresh(r.Context(), timeout); err != nil {
+			WriteErrorJSON(w, err)
+			return
+		}
+	default:
+		// Discourage the GET method:
+		http.Error(w, "want POST", http.StatusMethodNotAllowed)
 		return
 	}
+
 	res, err := h.b.SuggestExitNode()
 	if err != nil {
 		WriteErrorJSON(w, err)

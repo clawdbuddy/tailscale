@@ -6,6 +6,7 @@
 package localapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -37,7 +38,7 @@ func (h *Handler) serveRouteCheck(w http.ResponseWriter, r *http.Request) {
 	var report *routecheck.Report
 	if defBool(r.FormValue("force"), false) {
 		timeout := defDuration(r.FormValue("timeout"), routecheck.DefaultTimeout)
-		timeout = min(max(0, timeout), 60*time.Second) // clamp to [0s, 60s]
+		timeout = clampRouteCheckTimeout(timeout)
 		report, err = rc.Refresh(r.Context(), timeout)
 	} else {
 		report = rc.Report()
@@ -53,4 +54,23 @@ func (h *Handler) serveRouteCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(report)
+}
+
+func clampRouteCheckTimeout(timeout time.Duration) time.Duration {
+	return min(max(0, timeout), 60*time.Second) // clamp to [0s, 60s]
+}
+
+func (h *Handler) routeCheckRefresh(ctx context.Context, timeout time.Duration) error {
+	if !buildfeatures.HasRouteCheck {
+		return nil
+	}
+	rc := routecheck.ClientFor(h.b)
+	if rc == nil {
+		return nil
+	}
+	if timeout <= 0 {
+		timeout = routecheck.DefaultTimeout
+	}
+	_, err := rc.Refresh(ctx, clampRouteCheckTimeout(timeout))
+	return err
 }
