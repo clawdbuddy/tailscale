@@ -1382,30 +1382,52 @@ func TestLocalUnixForwardingHalfClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to dial unix socket through SSH: %s", err)
 	}
+	defer conn.Close()
 
-	// Send data and close write side (half-close).
-	_, err = io.WriteString(conn, "request data")
-	if err != nil {
+	// Send data and half-close the write side. The conn returned by
+	// (*ssh.Client).Dial("unix", ...) is a *chanConn, which embeds an
+	// ssh.Channel; ssh.Channel exposes CloseWrite (RFC 4254 §5.3 EOF).
+	// Type-assert to that capability rather than to *net.TCPConn (which
+	// will never match for an SSH-tunneled connection).
+	if _, err := io.WriteString(conn, "request data"); err != nil {
 		t.Fatalf("failed to write: %s", err)
 	}
-	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.CloseWrite()
-	} else {
-		// ssh.Conn doesn't expose CloseWrite, close the write side
-		// by closing the whole conn -- but then we can't read.
-		// Instead, just close and rely on the server seeing EOF.
-		conn.Close()
+	cw, ok := conn.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatalf("conn %T does not implement CloseWrite; cannot test half-close", conn)
+	}
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
 	}
 
-	// Read the delayed response. This is the critical assertion:
-	// with the old bicopy, this would fail because the connection
-	// would be torn down when we closed the write side.
-	got, err := io.ReadAll(conn)
-	if err != nil {
-		t.Fatalf("failed to read response: %s", err)
+	// Read the delayed response. This is the critical assertion: with
+	// the old bicopy, this would fail because the channel would be torn
+	// down when our write side finished and the server's response would
+	// never arrive.
+	//
+	// (*chanConn).SetReadDeadline returns an error, so we wrap the read
+	// in a goroutine with a hard deadline. A bug in the bicopy fix would
+	// manifest as a stuck read here, and the test must not allow the
+	// process to hang on it.
+	type readResult struct {
+		data []byte
+		err  error
 	}
-	if string(got) != response {
-		t.Errorf("got %q, want %q", got, response)
+	done := make(chan readResult, 1)
+	go func() {
+		got, err := io.ReadAll(conn)
+		done <- readResult{data: got, err: err}
+	}()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("failed to read response: %s", res.err)
+		}
+		if string(res.data) != response {
+			t.Errorf("got %q, want %q", res.data, response)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("timed out waiting for response after half-close; bicopy may be tearing down the channel prematurely")
 	}
 }
 
