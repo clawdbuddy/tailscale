@@ -1438,7 +1438,22 @@ func TestIntegrationSIGHUP(t *testing.T) {
 	debugTest.Store(true)
 	t.Cleanup(func() { debugTest.Store(false) })
 
-	markerFile := filepath.Join(t.TempDir(), "sighup-received")
+	// The marker file must live in a directory that the user shell
+	// (which may run as a different uid than the test, e.g. when the
+	// test runs as root and the incubator drops privileges to testuser)
+	// can both traverse and write into. t.TempDir creates two levels
+	// of directories, both 0700, which the dropped-privileges shell
+	// cannot enter; create our own world-traversable directory under
+	// /tmp instead.
+	markerDir, err := os.MkdirTemp("/tmp", "tailssh-sighup-")
+	if err != nil {
+		t.Fatalf("create marker dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(markerDir) })
+	if err := os.Chmod(markerDir, 0o777); err != nil {
+		t.Fatalf("chmod marker dir: %v", err)
+	}
+	markerFile := filepath.Join(markerDir, "sighup-received")
 
 	cl := testClient(t, false, false)
 	s, err := cl.NewSession()

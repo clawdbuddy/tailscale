@@ -246,6 +246,21 @@ func (ss *sshSession) newIncubatorCommand(logf logger.Logf) (cmd *exec.Cmd, err 
 	cmd = exec.CommandContext(ss.ctx, ss.conn.srv.tailscaledPath, incubatorArgs...)
 	// The incubator will chdir into the home directory after it drops privileges.
 	cmd.Dir = "/"
+
+	// Put the incubator (and any children it spawns, e.g. the user's
+	// login shell) into its own process group so that
+	// killProcessOnContextDone can deliver SIGHUP to the whole group via
+	// kill(2) on the negative PGID, matching POSIX terminal disconnect
+	// semantics. Without this, signaling cmd.Process.Pid only reaches
+	// the incubator itself and the user's shell never sees SIGHUP, so
+	// any HUP-trapping cleanup the user installed (.bash_logout-style)
+	// is silently skipped.
+	//
+	// The PTY path overrides SysProcAttr later in startWithPTY to set
+	// Setsid + Setctty, which also creates a new process group (Setsid
+	// implies Setpgid behavior), so this assignment is harmless to
+	// overwrite there.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	return cmd, nil
 }
 
@@ -1235,4 +1250,34 @@ func groupsMatchCurrent(groupIDs []int) bool {
 	sort.Ints(groupIDs)
 	sort.Ints(existing)
 	return slices.Equal(groupIDs, existing)
+}
+
+// terminateSession delivers sig to the incubator's process group. The
+// incubator is configured (via Setpgid in newIncubatorCommand for non-PTY
+// sessions, and Setsid in startWithPTY for PTY sessions) to be a process
+// group leader, so passing the negated PID to kill(2) reaches the
+// incubator and any descendants it spawned, including the user's shell.
+// This matches the POSIX terminal-disconnect semantics that OpenSSH
+// achieves via PTY master close.
+//
+// A signal targeted at the leader's PID alone would only reach the
+// incubator process and miss the user's shell, defeating any HUP traps
+// the user installed.
+//
+// ESRCH (process group already gone) is returned as nil because that
+// just means the session has already exited via cmd.Wait.
+func terminateSession(p *os.Process, sig os.Signal) error {
+	if p == nil {
+		return errors.New("nil process")
+	}
+	ssig, ok := sig.(syscall.Signal)
+	if !ok {
+		// Should never happen for the signals we use (SIGHUP, etc.).
+		return p.Signal(sig)
+	}
+	err := syscall.Kill(-p.Pid, ssig)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
 }

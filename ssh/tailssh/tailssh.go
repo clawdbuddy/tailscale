@@ -878,13 +878,20 @@ func (ss *sshSession) killProcessOnContextDone() {
 		// We don't need to Process.Wait here, sshSession.run() does
 		// the waiting regardless of termination reason.
 
-		// Send SIGHUP to match POSIX terminal disconnect semantics.
-		// OpenSSH achieves this implicitly by closing the PTY master fd
-		// (see openssh-portable session.c:2246), which causes the kernel
-		// to send SIGHUP to the child process group. Since tailssh uses
-		// pipes for non-PTY sessions, we send SIGHUP explicitly.
+		// Send SIGHUP to the user's process group to match POSIX
+		// terminal disconnect semantics. OpenSSH achieves this
+		// implicitly by closing the PTY master fd (see openssh-portable
+		// session.c:2246), which causes the kernel to send SIGHUP to
+		// the foreground process group. tailssh uses pipes for non-PTY
+		// sessions, so we deliver the signal explicitly. The Unix
+		// implementation targets the incubator's process group so the
+		// user's shell (a grandchild of the incubator) receives the
+		// signal too; without that, any HUP-trapping cleanup installed
+		// by the user is silently skipped.
 		// https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap11.html#tag_11_01_03
-		ss.cmd.Process.Signal(syscall.SIGHUP)
+		if err := terminateSession(ss.cmd.Process, syscall.SIGHUP); err != nil {
+			ss.logf("terminate session: %v", err)
+		}
 	})
 }
 

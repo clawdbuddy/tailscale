@@ -419,3 +419,16 @@ func acceptEnvPair(kv string) bool {
 	_ = k
 	return true // permit anything on plan9 during bringup, for debugging at least
 }
+
+// terminateSession delivers sig to the incubator process. plan9 does not
+// have Unix-style process groups, so we signal the incubator directly and
+// rely on the rest of run() to tear down whatever the incubator was
+// running. This is a regression compared to Unix where the user's shell
+// also receives the signal, but plan9 is a best-effort target for tailssh
+// today.
+func terminateSession(p *os.Process, sig os.Signal) error {
+	if p == nil {
+		return errors.New("nil process")
+	}
+	return p.Signal(sig)
+}
