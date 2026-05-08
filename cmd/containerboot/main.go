@@ -129,6 +129,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -147,6 +148,7 @@ import (
 	klc "tailscale.com/kube/localclient"
 	"tailscale.com/kube/metrics"
 	"tailscale.com/kube/services"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
@@ -995,18 +997,30 @@ func fetchNetMap(ctx context.Context, lc *local.Client) (*netmap.NetworkMap, err
 }
 
 // resolveTailnetFQDN resolves a tailnet FQDN to a list of IP prefixes, which
-// can be either a peer device or a Tailscale Service.
+// can be either a peer device, a Tailscale Service, or a 4via6 synthesized
+// DNS name (e.g. "10-1-0-5-via-7.tailnet.ts.net").
 func resolveTailnetFQDN(nm *netmap.NetworkMap, fqdn string) ([]netip.Prefix, error) {
 	dnsFQDN, err := dnsname.ToFQDN(fqdn)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing %q as FQDN: %w", fqdn, err)
 	}
 
-	// Check all peer devices first.
 	for _, p := range nm.Peers {
 		if strings.EqualFold(p.Name(), dnsFQDN.WithTrailingDot()) {
 			return p.Addresses().AsSlice(), nil
 		}
+	}
+
+	if addr, ok := resolveViaDomain(dnsFQDN); ok {
+		prefix := netip.PrefixFrom(addr, addr.BitLen())
+		for _, p := range nm.Peers {
+			for _, allowedIP := range p.AllowedIPs().All() {
+				if allowedIP.Contains(addr) {
+					return []netip.Prefix{prefix}, nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("resolved 4via6 address %v for %q but no peer advertises a route containing it", addr, fqdn)
 	}
 
 	// If not found yet, check for a matching Tailscale Service.
@@ -1054,4 +1068,30 @@ func serviceIPsFromNetMap(nm *netmap.NetworkMap, fqdn dnsname.FQDN) []netip.Pref
 	}
 
 	return prefixes
+}
+
+func resolveViaDomain(fqdn dnsname.FQDN) (netip.Addr, bool) {
+	name := string(fqdn.WithoutTrailingDot())
+	if !strings.Contains(name, "-via-") {
+		return netip.Addr{}, false
+	}
+	firstLabel, domain, _ := strings.Cut(name, ".")
+	if !(domain == "" || dnsname.HasSuffix(domain, "ts.net") || dnsname.HasSuffix(domain, "tailscale.net")) {
+		return netip.Addr{}, false
+	}
+	v4Hyphens, siteIDStr, ok := strings.Cut(firstLabel, "-via-")
+	if !ok {
+		return netip.Addr{}, false
+	}
+	ip4Str := strings.ReplaceAll(v4Hyphens, "-", ".")
+	ip4, err := netip.ParseAddr(ip4Str)
+	if err != nil || !ip4.Is4() {
+		return netip.Addr{}, false
+	}
+	siteID, err := strconv.ParseUint(siteIDStr, 0, 32)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	via, _ := tsaddr.MapVia(uint32(siteID), netip.PrefixFrom(ip4, ip4.BitLen()))
+	return via.Addr(), true
 }
