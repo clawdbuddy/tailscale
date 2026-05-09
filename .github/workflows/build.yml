@@ -1,9 +1,12 @@
-name: Build
+name: Tailscale Linux amd64
 
 on:
   push:
     branches:
       - main
+
+permissions:
+  contents: write
 
 env:
   VERSION: ${{ github.sha }}
@@ -42,6 +45,8 @@ jobs:
   create-release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -54,8 +59,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.sha }}
-          release_name: Tailscale ${{ github.sha }}
           files: artifacts/**/*
-          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
