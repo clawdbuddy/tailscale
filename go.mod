@@ -20,6 +20,7 @@ require (
 	github.com/bradfitz/monogok v0.0.0-20260429173803-229ef7981a6b
 	github.com/bramvdbogaerde/go-scp v1.4.0
 	github.com/cilium/ebpf v0.16.0
+	github.com/clawdbuddy/wireguard-go v0.0.0
 	github.com/coder/websocket v1.8.12
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
@@ -103,7 +104,6 @@ require (
 	github.com/tailscale/ts-gokrazy v0.0.0-20260429180033-fe741c6deb44
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976
 	github.com/tailscale/wf v0.0.0-20240214030419-6fbb0a674ee6
-	github.com/clawdbuddy/wireguard-go v0.0.0-latest
 	github.com/tailscale/xnet v0.0.0-20240729143630-8497ac4dab2e
 	github.com/tc-hib/winres v0.2.1
 	github.com/tcnksm/go-httpstat v0.2.0
@@ -505,6 +505,6 @@ require (
 	sigs.k8s.io/json v0.0.0-20241014173422-cfa47c3a1cc8 // indirect
 )
 
-replace github.com/clawdbuddy/wireguard-go => github.com/clawdbuddy/wireguard-go tailscale
+replace github.com/clawdbuddy/wireguard-go => github.com/clawdbuddy/wireguard-go v0.0.0-20260509093747-b576a3ba7883
 
 tool github.com/stacklok/frizbee
