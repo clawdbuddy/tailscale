@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"reflect"
 	"runtime"
 	"slices"
@@ -3332,6 +3333,9 @@ func (c *Conn) logEndpointChange(endpoints []tailcfg.Endpoint) {
 //
 // See https://pkg.go.dev/golang.zx2c4.com/wireguard/conn#Bind
 func (c *Conn) Bind() conn.Bind {
+	if os.Getenv("WG_QUIC_OBFUSCATION") != "" {
+		return conn.NewObfuscatingBind(c.bind)
+	}
 	return c.bind
 }
 
