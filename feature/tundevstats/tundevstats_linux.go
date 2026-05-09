@@ -16,7 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/mdlayher/netlink"
-	"github.com/tailscale/wireguard-go/tun"
+	"github.com/clawdbuddy/wireguard-go/tun"
 	"golang.org/x/sys/unix"
 	"tailscale.com/feature"
 	"tailscale.com/net/tstun"

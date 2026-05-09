@@ -14,7 +14,7 @@ import (
 
 	"github.com/mdlayher/netlink"
 	"github.com/mdlayher/netlink/nltest"
-	"github.com/tailscale/wireguard-go/tun"
+	"github.com/clawdbuddy/wireguard-go/tun"
 	"golang.org/x/sys/unix"
 )
 

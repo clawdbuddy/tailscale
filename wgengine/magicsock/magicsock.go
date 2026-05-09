@@ -25,8 +25,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/tailscale/wireguard-go/conn"
-	"github.com/tailscale/wireguard-go/device"
+	"github.com/clawdbuddy/wireguard-go/conn"
+	"github.com/clawdbuddy/wireguard-go/device"
 	"go4.org/mem"
 	"golang.org/x/net/ipv6"
 	"tailscale.com/control/controlknobs"
@@ -1441,7 +1441,7 @@ func (c *Conn) networkDown() bool {
 
 // Send implements conn.Bind.
 //
-// See https://pkg.go.dev/github.com/tailscale/wireguard-go/conn#Bind.Send
+// See https://pkg.go.dev/github.com/clawdbuddy/wireguard-go/conn#Bind.Send
 func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint, offset int) (err error) {
 	n := int64(len(buffs))
 	defer func() {
@@ -1827,7 +1827,7 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
 		// Strip away the Geneve header before returning the packet to
 		// wireguard-go.
 		//
-		// TODO(jwhited): update [github.com/tailscale/wireguard-go/conn.ReceiveFunc]
+		// TODO(jwhited): update [github.com/clawdbuddy/wireguard-go/conn.ReceiveFunc]
 		//  to support returning start offset in order to get rid of this memmove perf
 		//  penalty.
 		size = copy(b, b[packet.GeneveFixedHeaderLength:])

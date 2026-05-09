@@ -9,7 +9,7 @@ package gro
 import (
 	"bytes"
 
-	"github.com/tailscale/wireguard-go/tun"
+	"github.com/clawdbuddy/wireguard-go/tun"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"

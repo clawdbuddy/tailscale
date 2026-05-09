@@ -19,8 +19,8 @@ import (
 	"time"
 
 	"github.com/gaissmai/bart"
-	"github.com/tailscale/wireguard-go/device"
-	"github.com/tailscale/wireguard-go/tun"
+	"github.com/clawdbuddy/wireguard-go/device"
+	"github.com/clawdbuddy/wireguard-go/tun"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/drive"
 	"tailscale.com/envknob"

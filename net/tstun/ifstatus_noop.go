@@ -8,7 +8,7 @@ package tstun
 import (
 	"time"
 
-	"github.com/tailscale/wireguard-go/tun"
+	"github.com/clawdbuddy/wireguard-go/tun"
 	"tailscale.com/types/logger"
 )
 
