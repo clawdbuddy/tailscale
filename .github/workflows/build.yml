@@ -5,6 +5,9 @@ on:
     branches:
       - main
 
+env:
+  VERSION: ${{ github.sha }}
+
 jobs:
   build:
     strategy:
@@ -43,15 +46,47 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
+          VERSION_SHORT: ${{ env.VERSION }}
+          VERSION_LONG: ${{ env.VERSION }}
+          VERSION_GIT_HASH: ${{ env.VERSION }}
         run: |
           ./build_dist.sh tailscale.com/cmd/tailscale
           ./build_dist.sh tailscale.com/cmd/tailscaled
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Rename for upload
+        shell: bash
+        run: |
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            EXT=".exe"
+          fi
+          mv tailscale${EXT} tailscale-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}
+          mv tailscaled${EXT} tailscaled-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}
+
+      - uses: actions/upload-artifact@v4
         with:
           name: tailscale-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
-            tailscale
-            tailscaled
+            tailscale-${{ matrix.goos }}-${{ matrix.goarch }}*
           retention-days: 7
+
+  create-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.sha }}
+          release_name: Tailscale ${{ github.sha }}
+          files: artifacts/**/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
