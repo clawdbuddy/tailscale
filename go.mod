@@ -20,7 +20,7 @@ require (
 	github.com/bradfitz/monogok v0.0.0-20260429173803-229ef7981a6b
 	github.com/bramvdbogaerde/go-scp v1.4.0
 	github.com/cilium/ebpf v0.16.0
-	github.com/clawdbuddy/wireguard-go v0.0.0
+	github.com/clawdbuddy/wireguard-go v0.0.0-20260509152846-cc73c9e2407c
 	github.com/coder/websocket v1.8.12
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
@@ -504,7 +504,5 @@ require (
 	mvdan.cc/unparam v0.0.0-20240104100049-c549a3470d14 // indirect
 	sigs.k8s.io/json v0.0.0-20241014173422-cfa47c3a1cc8 // indirect
 )
-
-replace github.com/clawdbuddy/wireguard-go => github.com/clawdbuddy/wireguard-go v0.0.0-20260509093747-b576a3ba7883
 
 tool github.com/stacklok/frizbee

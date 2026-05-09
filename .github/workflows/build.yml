@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  VERSION: ${{ github.sha }}
+  VERSION: ${{ github.run_id }}
 
 jobs:
   build:
