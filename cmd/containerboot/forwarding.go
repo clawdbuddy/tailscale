@@ -114,13 +114,13 @@ func installEgressForwardingRule(_ context.Context, dstStr string, tsIPs []netip
 	if !local.IsValid() {
 		return fmt.Errorf("no tailscale IP matching family of %s found in %v", dstStr, tsIPs)
 	}
-	if err := nfr.DNATNonTailscaleTraffic("tailscale-cn0", dst); err != nil {
+	if err := nfr.DNATNonTailscaleTraffic("tailscale0", dst); err != nil {
 		return fmt.Errorf("installing egress proxy rules: %w", err)
 	}
 	if err := nfr.EnsureSNATForDst(local, dst); err != nil {
 		return fmt.Errorf("installing egress proxy rules: %w", err)
 	}
-	if err := nfr.ClampMSSToPMTU("tailscale-cn0", dst); err != nil {
+	if err := nfr.ClampMSSToPMTU("tailscale0", dst); err != nil {
 		return fmt.Errorf("installing egress proxy rules: %w", err)
 	}
 	return nil
@@ -184,7 +184,7 @@ func installIngressForwardingRule(_ context.Context, dstStr string, tsIPs []neti
 	if err := nfr.AddDNATRule(local, dst); err != nil {
 		return fmt.Errorf("installing ingress proxy rules: %w", err)
 	}
-	if err := nfr.ClampMSSToPMTU("tailscale-cn0", dst); err != nil {
+	if err := nfr.ClampMSSToPMTU("tailscale0", dst); err != nil {
 		return fmt.Errorf("installing ingress proxy rules: %w", err)
 	}
 	return nil
@@ -234,10 +234,10 @@ func installIngressForwardingRuleForDNSTarget(_ context.Context, backendAddrs []
 		}
 		// The backend might advertize MSS higher than that of the
 		// tailscale interfaces. Clamp MSS of packets going out via
-		// tailscale-cn0 interface to its MTU to prevent broken connections
+		// tailscale0 interface to its MTU to prevent broken connections
 		// in environments where path MTU discovery is not working.
-		if err := nfr.ClampMSSToPMTU("tailscale-cn0", dst); err != nil {
-			return fmt.Errorf("adding rule to clamp traffic via tailscale-cn0: %v", err)
+		if err := nfr.ClampMSSToPMTU("tailscale0", dst); err != nil {
+			return fmt.Errorf("adding rule to clamp traffic via tailscale0: %v", err)
 		}
 		return nil
 	}
