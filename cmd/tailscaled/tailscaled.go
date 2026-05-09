@@ -85,10 +85,10 @@ func defaultTunName() string {
 		if buildfeatures.HasSynology && buildfeatures.HasNetstack && distro.Get() == distro.Synology {
 			// Try TUN, but fall back to userspace networking if needed.
 			// See https://github.com/tailscale/tailscale-synology/issues/35
-			return "tailscale0,userspace-networking"
+			return "tailscale-cn0,userspace-networking"
 		}
 	}
-	return "tailscale0"
+	return "tailscale-cn0"
 }
 
 // defaultPort returns the default UDP port to listen on for disco+wireguard.

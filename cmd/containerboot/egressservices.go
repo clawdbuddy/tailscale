@@ -33,7 +33,7 @@ import (
 	"tailscale.com/util/mak"
 )
 
-const tailscaleTunInterface = "tailscale0"
+const tailscaleTunInterface = "tailscale-cn0"
 
 // Modified using a build flag to speed up tests.
 var testSleepDuration string
