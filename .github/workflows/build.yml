@@ -10,29 +10,7 @@ env:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-          - os: ubuntu-latest
-            goos: linux
-            goarch: arm64
-          - os: ubuntu-latest
-            goos: linux
-            goarch: 386
-          - os: macos-latest
-            goos: darwin
-            goarch: amd64
-          - os: macos-latest
-            goos: darwin
-            goarch: arm64
-          - os: windows-latest
-            goos: windows
-            goarch: amd64
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -43,8 +21,8 @@ jobs:
 
       - name: Build tailscale & tailscaled
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+          GOOS: linux
+          GOARCH: amd64
           CGO_ENABLED: 0
           VERSION_SHORT: ${{ env.VERSION }}
           VERSION_LONG: ${{ env.VERSION }}
@@ -53,21 +31,12 @@ jobs:
           ./build_dist.sh tailscale.com/cmd/tailscale
           ./build_dist.sh tailscale.com/cmd/tailscaled
 
-      - name: Rename for upload
-        shell: bash
-        run: |
-          EXT=""
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            EXT=".exe"
-          fi
-          mv tailscale${EXT} tailscale-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}
-          mv tailscaled${EXT} tailscaled-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}
-
       - uses: actions/upload-artifact@v4
         with:
-          name: tailscale-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: tailscale-linux-amd64
           path: |
-            tailscale-${{ matrix.goos }}-${{ matrix.goarch }}*
+            tailscale
+            tailscaled
           retention-days: 7
 
   create-release:
