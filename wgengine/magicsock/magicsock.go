@@ -1460,7 +1460,7 @@ func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint, offset int) (err error) {
 	// If QUIC obfuscation is enabled, prepend QUIC header and adjust offset
 	// so the underlying layer sees the original packet at the Geneve offset.
 	if os.Getenv("WG_QUIC_OBFUSCATION") != "" {
-		offset = c.maybePrependQUICHeader(buffs, ep, offset)
+		offset, ep = c.maybePrependQUICHeader(buffs, ep, offset)
 		if offset < 0 {
 			return nil
 		}
@@ -1473,10 +1473,15 @@ func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint, offset int) (err error) {
 		// A [*lazyEndpoint] may end up on this TX codepath when wireguard-go is
 		// deemed "under handshake load" and ends up transmitting a cookie reply
 		// using the received [conn.Endpoint] in [device.SendHandshakeCookie].
-		if ep.src.ap.Addr().Is6() {
-			return c.pconn6.WriteWireGuardBatchTo(buffs, ep.src, offset)
+		src := ep.src
+		if offset == packet.GeneveFixedHeaderLength {
+			// Force VNI so Geneve path is used (avoids offset slicing bug in batching)
+			src.vni.Set(1)
 		}
-		return c.pconn4.WriteWireGuardBatchTo(buffs, ep.src, offset)
+		if src.ap.Addr().Is6() {
+			return c.pconn6.WriteWireGuardBatchTo(buffs, src, offset)
+		}
+		return c.pconn4.WriteWireGuardBatchTo(buffs, src, offset)
 	}
 	return nil
 }
@@ -1496,19 +1501,19 @@ const (
 )
 
 // maybePrependQUICHeader adds QUIC-style obfuscation headers to buffs.
-// It returns the adjusted offset so the underlying layer sees the WireGuard
-// packet at the expected Geneve offset. Returns -1 to skip this packet.
-func (c *Conn) maybePrependQUICHeader(buffs [][]byte, ep conn.Endpoint, offset int) int {
+// It returns the adjusted offset and endpoint so the caller can set VNI on the
+// endpoint. Returns offset=-1 to skip.
+func (c *Conn) maybePrependQUICHeader(buffs [][]byte, ep conn.Endpoint, offset int) (int, conn.Endpoint) {
 	if offset != packet.GeneveFixedHeaderLength {
-		return offset
+		return offset, ep
 	}
 	if len(buffs) == 0 {
-		return offset
+		return offset, ep
 	}
 
 	buf := buffs[0]
 	if len(buf) < offset {
-		return offset
+		return offset, ep
 	}
 
 	msgType := buf[offset]
@@ -1519,7 +1524,7 @@ func (c *Conn) maybePrependQUICHeader(buffs [][]byte, ep conn.Endpoint, offset i
 	case msgType == conn.MessageTransportType:
 		quicHdrLen = quicShortHdrLen
 	default:
-		return offset
+		return offset, ep
 	}
 
 	cid := deriveQUICConnectionID(ep)
@@ -1554,7 +1559,7 @@ func (c *Conn) maybePrependQUICHeader(buffs [][]byte, ep conn.Endpoint, offset i
 		}
 	}
 
-	return 0
+	return 0, ep
 }
 
 // deriveQUICConnectionID derives an 8-byte connection ID for QUIC obfuscation.
