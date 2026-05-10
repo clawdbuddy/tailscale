@@ -1526,7 +1526,7 @@ func (c *Conn) maybePrependQUICHeader(buffs [][]byte, ep conn.Endpoint, offset i
 	c.logf("WireGuard QUIC obfuscation: sending to %s, CID=%x", ep.DstToString(), cid[:4])
 
 	for _, buf := range buffs {
-		if len(buf) < offset {
+		if len(buf) < quicHdrLen+offset {
 			continue
 		}
 		msgType = buf[offset]
@@ -1540,12 +1540,14 @@ func (c *Conn) maybePrependQUICHeader(buffs [][]byte, ep conn.Endpoint, offset i
 			buf[5] = quicCIDLength
 			copy(buf[6:6+quicCIDLength], cid[:])
 			buf[14] = 0x00
-			counter := binary.LittleEndian.Uint64(buf[quicHdrLen+8:])
+			// Counter is at offset+8 within the WireGuard header
+			counter := binary.LittleEndian.Uint64(buf[offset+8:])
 			binary.LittleEndian.PutUint16(buf[15:], uint16(counter))
 		} else if msgType == conn.MessageTransportType {
 			buf[0] = 0x40
 			copy(buf[1:1+quicCIDLength], cid[:])
-			counter := binary.LittleEndian.Uint64(buf[quicHdrLen+8:])
+			// Counter is at offset+8 within the WireGuard header
+			counter := binary.LittleEndian.Uint64(buf[offset+8:])
 			binary.LittleEndian.PutUint16(buf[9:], uint16(counter))
 		} else {
 			continue
