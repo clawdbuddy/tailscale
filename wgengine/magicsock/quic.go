@@ -21,20 +21,11 @@ const (
 	quicLongHdrLen  = 17
 )
 
-// quicObfuscation controls whether QUIC obfuscation is enabled.
-// Set via TS_QUIC_OBFUSCATION env var (also accepts WG_QUIC_OBFUSCATION for
-// backward compatibility with wireguard-go standalone).
-var quicObfuscation = func() func() bool {
-	if envknob.Bool("TS_QUIC_OBFUSCATION") {
-		return func() bool { return true }
-	}
-	return envknob.RegisterBool("WG_QUIC_OBFUSCATION")
-}()
+var quicObfuscationTS = envknob.RegisterBool("TS_QUIC_OBFUSCATION")
+var quicObfuscationWG = envknob.RegisterBool("WG_QUIC_OBFUSCATION")
 
-// quicObfuscationEnabled reports whether QUIC obfuscation is enabled for
-// direct UDP traffic.
 func quicObfuscationEnabled() bool {
-	return quicObfuscation()
+	return quicObfuscationTS() || quicObfuscationWG()
 }
 
 // quicState holds per-connection QUIC obfuscation state.
