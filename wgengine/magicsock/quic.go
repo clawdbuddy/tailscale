@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	quicCIDLength   = 8
-	quicShortHdrLen = 11
-	quicLongHdrLen  = 17
+	geneveFixedHdrLen = 8
+	quicCIDLength     = 8
+	quicShortHdrLen   = 11
+	quicLongHdrLen    = 17
 )
 
 var quicObfuscationTS = envknob.RegisterBool("TS_QUIC_OBFUSCATION")
@@ -150,7 +151,7 @@ func stripQUICHeader(b []byte, size int) (int, bool) {
 // It returns the total packet length (QUIC header + WireGuard data).
 // The buffer must have at least quicHdrLen + wgLen bytes capacity.
 func wrapQUICPacket(buf []byte, offset int, cid [8]byte) int {
-	if len(buf) < offset {
+	if offset != geneveFixedHdrLen || len(buf) < offset {
 		return len(buf)
 	}
 
@@ -195,9 +196,6 @@ func (c *Conn) sendQUICDirect(addr netip.AddrPort, buffs [][]byte, offset int, c
 
 	for _, buf := range buffs {
 		totalLen := wrapQUICPacket(buf, offset, cid)
-		if totalLen == len(buf) && offset == 0 {
-			totalLen = len(buf)
-		}
 
 		var err error
 		if isIPv6 {

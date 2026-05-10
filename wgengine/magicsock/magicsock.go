@@ -1745,8 +1745,12 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
 				ipp := msg.Addr.(*net.UDPAddr).AddrPort()
 
 				if c.quicState.quicObfuscation.Load() {
-					if newN, stripped := stripQUICHeader(msg.Buffers[0], msg.N); stripped {
-						msg.N = newN
+					// disco magic 首字节 0x54 命中 QUIC 短包头检测的 0x40 位,
+					// 直接 strip 会砍掉 11 字节,破坏握手 magic,导致直连协商失败。
+					if !disco.LooksLikeDiscoWrapper(msg.Buffers[0][:msg.N]) {
+						if newN, stripped := stripQUICHeader(msg.Buffers[0], msg.N); stripped {
+							msg.N = newN
+						}
 					}
 				}
 
