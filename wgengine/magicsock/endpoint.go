@@ -1072,7 +1072,12 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	}
 	var err error
 	if udpAddr.ap.IsValid() {
-		_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
+		if de.c.quicState.quicObfuscation.Load() {
+			cid := de.c.quicState.getConnectionID(de)
+			err = de.c.sendQUICDirect(udpAddr.ap, buffs, offset, cid)
+		} else {
+			_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
+		}
 
 		// If the error is known to indicate that the endpoint is no longer
 		// usable, clear the endpoint statistics so that the next send will
@@ -1083,7 +1088,11 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 
 		var txBytes int
 		for _, b := range buffs {
-			txBytes += len(b[offset:])
+			if de.c.quicState.quicObfuscation.Load() {
+				txBytes += len(b)
+			} else {
+				txBytes += len(b[offset:])
+			}
 		}
 
 		switch {

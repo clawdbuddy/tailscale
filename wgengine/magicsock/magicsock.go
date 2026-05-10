@@ -9,7 +9,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
@@ -17,7 +16,6 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"os"
 	"reflect"
 	"runtime"
 	"slices"
@@ -215,6 +213,9 @@ type Conn struct {
 
 	// bind is the wireguard-go conn.Bind for Conn.
 	bind *connBind
+
+	// quicState holds QUIC obfuscation state.
+	quicState *quicState
 
 	// cloudInfo is used to query cloud metadata services.
 	cloudInfo *cloudinfo.CloudInfo
@@ -563,7 +564,12 @@ func newConn(logf logger.Logf) *Conn {
 		peerLastDerp: make(map[key.NodePublic]int),
 		peerMap:      newPeerMap(),
 		discoInfo:    make(map[key.DiscoPublic]*discoInfo),
+		quicState:    newQUICState(),
 		cloudInfo:    cloudinfo.New(logf),
+	}
+	if quicObfuscationEnabled() {
+		c.logf("magicsock: QUIC obfuscation enabled")
+		c.quicState.quicObfuscation.Store(true)
 	}
 	c.discoAtomic.Set(discoPrivate)
 	c.bind = &connBind{Conn: c, closed: true}
@@ -1457,15 +1463,6 @@ func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint, offset int) (err error) {
 		return errNetworkDown
 	}
 
-	// If QUIC obfuscation is enabled, prepend QUIC header and adjust offset
-	// so the underlying layer sees the original packet at the Geneve offset.
-	if os.Getenv("WG_QUIC_OBFUSCATION") != "" {
-		offset, ep = c.maybePrependQUICHeader(buffs, ep, offset)
-		if offset < 0 {
-			return nil
-		}
-	}
-
 	switch ep := ep.(type) {
 	case *endpoint:
 		return ep.send(buffs, offset)
@@ -1493,82 +1490,6 @@ var errDropDerpPacket = errors.New("too many DERP packets queued; dropping")
 var errNoUDP = errors.New("no UDP available on platform")
 
 var errUnsupportedConnType = errors.New("unsupported connection type")
-
-const (
-	quicCIDLength   = 8  // Connection ID length
-	quicShortHdrLen = 11 // Short header: 1 + CID + 2 (pkn varint)
-	quicLongHdrLen  = 17 // Long header (Initial): 1 + 4 + 1 + 8 + 2 + 1 (token)
-)
-
-// maybePrependQUICHeader adds QUIC-style obfuscation headers to buffs.
-// It returns the adjusted offset and endpoint so the caller can set VNI on the
-// endpoint. Returns offset=-1 to skip.
-func (c *Conn) maybePrependQUICHeader(buffs [][]byte, ep conn.Endpoint, offset int) (int, conn.Endpoint) {
-	if offset != packet.GeneveFixedHeaderLength {
-		return offset, ep
-	}
-	if len(buffs) == 0 {
-		return offset, ep
-	}
-
-	buf := buffs[0]
-	if len(buf) < offset {
-		return offset, ep
-	}
-
-	msgType := buf[offset]
-	var quicHdrLen int
-	switch {
-	case msgType >= conn.MessageInitiationType && msgType <= conn.MessageCookieReplyType:
-		quicHdrLen = quicLongHdrLen
-	case msgType == conn.MessageTransportType:
-		quicHdrLen = quicShortHdrLen
-	default:
-		return offset, ep
-	}
-
-	cid := deriveQUICConnectionID(ep)
-	c.logf("WireGuard QUIC obfuscation: sending to %s, CID=%x", ep.DstToString(), cid[:4])
-
-	for _, buf := range buffs {
-		if len(buf) < quicHdrLen+offset {
-			continue
-		}
-		msgType = buf[offset]
-		if msgType >= conn.MessageInitiationType && msgType <= conn.MessageCookieReplyType {
-			// Long header for handshake
-			buf[0] = 0xC0 | 0x01
-			buf[1] = 0x00
-			buf[2] = 0x00
-			buf[3] = 0x00
-			buf[4] = 0x01
-			buf[5] = quicCIDLength
-			copy(buf[6:6+quicCIDLength], cid[:])
-			buf[14] = 0x00
-			// Counter is at offset+8 within the WireGuard header
-			counter := binary.LittleEndian.Uint64(buf[offset+8:])
-			binary.LittleEndian.PutUint16(buf[15:], uint16(counter))
-		} else if msgType == conn.MessageTransportType {
-			buf[0] = 0x40
-			copy(buf[1:1+quicCIDLength], cid[:])
-			// Counter is at offset+8 within the WireGuard header
-			counter := binary.LittleEndian.Uint64(buf[offset+8:])
-			binary.LittleEndian.PutUint16(buf[9:], uint16(counter))
-		} else {
-			continue
-		}
-	}
-
-	return 0, ep
-}
-
-// deriveQUICConnectionID derives an 8-byte connection ID for QUIC obfuscation.
-func deriveQUICConnectionID(ep conn.Endpoint) [8]byte {
-	h := sha256.Sum256(ep.DstToBytes())
-	var cid [8]byte
-	copy(cid[:], h[:8])
-	return cid
-}
 
 func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool, err error) {
 	isIPv6 := false
@@ -1822,6 +1743,13 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
 					continue
 				}
 				ipp := msg.Addr.(*net.UDPAddr).AddrPort()
+
+				if c.quicState.quicObfuscation.Load() {
+					if newN, stripped := stripQUICHeader(msg.Buffers[0], msg.N); stripped {
+						msg.N = newN
+					}
+				}
+
 				if ep, size, isGeneveEncap, ok := c.receiveIP(msg.Buffers[0][:msg.N], ipp, &epCache); ok {
 					if isGeneveEncap {
 						if peerRelayPacketMetric != nil {
