@@ -34,12 +34,36 @@ jobs:
           ./build_dist.sh tailscale.com/cmd/tailscale
           ./build_dist.sh tailscale.com/cmd/tailscaled
 
+      - name: Build .deb package
+        run: |
+          mkdir -p tailscale-deb/DEBIAN
+          mkdir -p tailscale-deb/usr/bin
+          mkdir -p tailscale-deb/lib/systemd/system
+          cat > tailscale-deb/DEBIAN/control << 'EOF'
+          Package: tailscale
+          Version: ${{ env.VERSION }}
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Tailscale Inc <support@tailscale.com>
+          Description: Tailscale VPN daemon and CLI
+           Tailscale is a zero config VPN for building secure networks.
+           It installs on any device in minutes, manages firewall rules for you,
+           and works from anywhere.
+          Depends: iptables, iproute2
+          EOF
+          cp tailscale tailscale-deb/usr/bin/
+          cp tailscaled tailscale-deb/usr/bin/
+          cp cmd/tailscaled/tailscaled.service tailscale-deb/lib/systemd/system/
+          dpkg-deb --build tailscale-deb tailscale_${{ env.VERSION }}_amd64.deb
+
       - uses: actions/upload-artifact@v4
         with:
           name: tailscale-linux-amd64
           path: |
             tailscale
             tailscaled
+            tailscale_${{ env.VERSION }}_amd64.deb
           retention-days: 7
 
   create-release:
