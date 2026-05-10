@@ -1,4 +1,4 @@
-name: Tailscale Linux amd64
+name: Build Release
 
 on:
   push:
@@ -9,11 +9,31 @@ permissions:
   contents: write
 
 env:
-  VERSION: ${{ github.run_id }}
+  VERSION: v0.0.1
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            name: linux-amd64
+            pkg: deb
+          - goos: linux
+            goarch: arm64
+            name: linux-arm64
+            pkg: deb
+          - goos: darwin
+            goarch: arm64
+            name: macos-arm64
+            pkg: zip
+          - goos: windows
+            goarch: amd64
+            name: windows-amd64
+            pkg: zip
+            ext: .exe
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -24,17 +44,20 @@ jobs:
 
       - name: Build tailscale & tailscaled
         env:
-          GOOS: linux
-          GOARCH: amd64
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
           VERSION_SHORT: ${{ env.VERSION }}
           VERSION_LONG: ${{ env.VERSION }}
           VERSION_GIT_HASH: ${{ env.VERSION }}
         run: |
           ./build_dist.sh tailscale.com/cmd/tailscale
+          mv tailscale tailscale${{ matrix.ext }}
           ./build_dist.sh tailscale.com/cmd/tailscaled
+          mv tailscaled tailscaled${{ matrix.ext }}
 
-      - name: Build .deb package
+      - name: Package .deb (Linux)
+        if: matrix.pkg == 'deb'
         run: |
           mkdir -p tailscale-deb/DEBIAN
           mkdir -p tailscale-deb/usr/bin
@@ -44,7 +67,7 @@ jobs:
           Version: ${{ env.VERSION }}
           Section: net
           Priority: optional
-          Architecture: amd64
+          Architecture: ${{ matrix.goarch }}
           Maintainer: Tailscale Inc <support@tailscale.com>
           Description: Tailscale VPN daemon and CLI
            Tailscale is a zero config VPN for building secure networks.
@@ -55,15 +78,23 @@ jobs:
           cp tailscale tailscale-deb/usr/bin/
           cp tailscaled tailscale-deb/usr/bin/
           cp cmd/tailscaled/tailscaled.service tailscale-deb/lib/systemd/system/
-          dpkg-deb --build tailscale-deb tailscale_${{ env.VERSION }}_amd64.deb
+          dpkg-deb --build tailscale-deb tailscale_${{ env.VERSION }}_${{ matrix.name }}.deb
+
+      - name: Package .zip (macOS/Windows)
+        if: matrix.pkg == 'zip'
+        run: |
+          mkdir -p tailscale-zip
+          cp tailscale${{ matrix.ext }} tailscale-zip/
+          cp tailscaled${{ matrix.ext }} tailscale-zip/
+          zip -j tailscale_${{ env.VERSION }}_${{ matrix.name }}.zip tailscale-zip/*
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tailscale-linux-amd64
+          name: tailscale-${{ matrix.name }}
           path: |
-            tailscale
-            tailscaled
-            tailscale_${{ env.VERSION }}_amd64.deb
+            tailscale${{ matrix.ext }}
+            tailscaled${{ matrix.ext }}
+            tailscale_${{ env.VERSION }}_${{ matrix.name }}.*
           retention-days: 7
 
   create-release:
@@ -82,7 +113,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v-${{ github.run_id }}
+          tag_name: ${{ env.VERSION }}
           files: artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
