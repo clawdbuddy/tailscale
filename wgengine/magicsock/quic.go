@@ -168,6 +168,13 @@ func wrapQUICPacket(buf []byte, offset int, cid [8]byte) int {
 
 	wgLen := len(buf) - offset
 
+	// 如果 buffer capacity 不足以容纳 QUIC header + WG payload，
+	// 回退为发送裸 WireGuard 包（不包装 QUIC header）。
+	// 裸 WG 包首字节为 1-4，接收端 stripQUICHeader 不会误剥离。
+	if cap(buf) < hdrLen+wgLen {
+		return offset + wgLen
+	}
+
 	counter := binary.LittleEndian.Uint64(buf[offset+8:])
 
 	copy(buf[hdrLen:hdrLen+wgLen], buf[offset:offset+wgLen])
