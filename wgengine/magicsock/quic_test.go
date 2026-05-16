@@ -39,13 +39,24 @@ func TestStripQUICHeaderPreservesNonWireGuard(t *testing.T) {
 	wgTransport := make([]byte, 32)
 	wgTransport[0] = device.MessageTransportType
 	binary.LittleEndian.PutUint64(wgTransport[8:], 0xdeadbeef)
-	wgTransportWrapped := prependQUICHeader(wgTransport, [8]byte{1, 2, 3, 4, 5, 6, 7, 8})
+	wgTransportWrapped := make([]byte, quicShortHdrLen+len(wgTransport))
+	wgTransportWrapped[0] = 0x40
+	copy(wgTransportWrapped[1:9], []byte{1, 2, 3, 4, 5, 6, 7, 8})
+	binary.LittleEndian.PutUint16(wgTransportWrapped[9:11], uint16(0xdeadbeef))
+	copy(wgTransportWrapped[quicShortHdrLen:], wgTransport)
 
 	// Build a valid wrapped QUIC long-header WG initiation packet.
 	wgInit := make([]byte, 64)
 	wgInit[0] = device.MessageInitiationType
 	binary.LittleEndian.PutUint64(wgInit[8:], 0x1234)
-	wgInitWrapped := prependQUICHeader(wgInit, [8]byte{1, 2, 3, 4, 5, 6, 7, 8})
+	wgInitWrapped := make([]byte, quicLongHdrLen+len(wgInit))
+	wgInitWrapped[0] = 0xC0 | 0x01
+	binary.BigEndian.PutUint32(wgInitWrapped[1:5], 1)
+	wgInitWrapped[5] = quicCIDLength
+	copy(wgInitWrapped[6:14], []byte{1, 2, 3, 4, 5, 6, 7, 8})
+	wgInitWrapped[14] = 0
+	binary.LittleEndian.PutUint16(wgInitWrapped[15:17], uint16(0x1234))
+	copy(wgInitWrapped[quicLongHdrLen:], wgInit)
 
 	tests := []struct {
 		name        string

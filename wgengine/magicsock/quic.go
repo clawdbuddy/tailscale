@@ -6,7 +6,6 @@ package magicsock
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"log"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -68,54 +67,6 @@ func (qs *quicState) getConnectionID(ep conn.Endpoint) [8]byte {
 	qs.connectionIDs[addr] = cid
 	qs.connectionIDsMu.Unlock()
 	return cid
-}
-
-// quicHeaderLen returns the QUIC header length for a WireGuard message,
-// or 0 if the message type is unknown (not WireGuard).
-func quicHeaderLen(b []byte) int {
-	if len(b) == 0 {
-		return 0
-	}
-	msgType := b[0]
-	switch {
-	case msgType >= conn.MessageInitiationType && msgType <= conn.MessageCookieReplyType:
-		return quicLongHdrLen
-	case msgType == conn.MessageTransportType:
-		return quicShortHdrLen
-	default:
-		return 0
-	}
-}
-
-// prependQUICHeader prepends a QUIC-like header to a WireGuard packet.
-// It returns a new slice containing the QUIC header followed by the WireGuard payload.
-// The input b is not modified.
-func prependQUICHeader(b []byte, cid [8]byte) []byte {
-	hdrLen := quicHeaderLen(b)
-	if hdrLen == 0 {
-		return b
-	}
-
-	msgType := b[0]
-	out := make([]byte, hdrLen+len(b))
-
-	if msgType >= conn.MessageInitiationType && msgType <= conn.MessageCookieReplyType {
-		out[0] = 0xC0 | 0x01
-		binary.BigEndian.PutUint32(out[1:5], 1)
-		out[5] = quicCIDLength
-		copy(out[6:14], cid[:])
-		out[14] = 0
-		counter := binary.LittleEndian.Uint64(b[8:])
-		binary.LittleEndian.PutUint16(out[15:], uint16(counter))
-	} else {
-		out[0] = 0x40
-		copy(out[1:9], cid[:])
-		counter := binary.LittleEndian.Uint64(b[8:])
-		binary.LittleEndian.PutUint16(out[9:], uint16(counter))
-	}
-
-	copy(out[hdrLen:], b)
-	return out
 }
 
 // stripQUICHeader strips a QUIC-like header from a packet in-place.
@@ -218,23 +169,4 @@ func (c *Conn) sendQUICDirect(addr netip.AddrPort, buffs [][]byte, offset int, c
 	return nil
 }
 
-// quicLogLimit limits QUIC obfuscation log messages to avoid spam.
-var quicLogLimit = func() func() bool {
-	var mu sync.Mutex
-	var count int
-	return func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		count++
-		if count <= 3 || count%100 == 0 {
-			return true
-		}
-		return false
-	}
-}()
 
-func logQUIC(format string, args ...any) {
-	if quicLogLimit() {
-		log.Printf(format, args...)
-	}
-}
