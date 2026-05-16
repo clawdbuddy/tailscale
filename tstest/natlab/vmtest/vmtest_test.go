@@ -5,13 +5,17 @@ package vmtest_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/netip"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"tailscale.com/client/local"
+	"tailscale.com/ipn"
+	"tailscale.com/net/udprelay/status"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/integration/testcontrol"
@@ -19,9 +23,23 @@ import (
 	"tailscale.com/tstest/natlab/vnet"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
+	"tailscale.com/util/set"
 )
 
+// skipIfNotMacOSArm64 skips the test when the host isn't a macOS arm64 host.
+// macOS VM tests require Apple Virtualization.framework via tailmac.
+// AddNode also enforces this when a macOS node is added, but having an
+// explicit skip at the top of macOS-only tests makes the requirement
+// obvious to readers.
+func skipIfNotMacOSArm64(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skipf("macOS VM tests require a macOS arm64 host (got %s/%s)", runtime.GOOS, runtime.GOARCH)
+	}
+}
+
 func TestMacOSAndLinuxCanPing(t *testing.T) {
+	skipIfNotMacOSArm64(t)
 	env := vmtest.New(t)
 
 	lan := env.AddNetwork("192.168.1.1/24")
@@ -39,6 +57,7 @@ func TestMacOSAndLinuxCanPing(t *testing.T) {
 }
 
 func TestTwoMacOSVMsCanPing(t *testing.T) {
+	skipIfNotMacOSArm64(t)
 	env := vmtest.New(t)
 
 	lan := env.AddNetwork("192.168.1.1/24")
@@ -95,8 +114,7 @@ func testSubnetRouterForOS(t testing.TB, srOS vmtest.OSImage) {
 	httpStep.Begin()
 	body := env.HTTPGet(client, fmt.Sprintf("http://%s:8080/", backend.LanIP(internalNet)))
 	if !strings.Contains(body, "Hello world I am backend") {
-		httpStep.End(fmt.Errorf("got %q", body))
-		t.Fatalf("got %q", body)
+		httpStep.Fatalf("got %q", body)
 	}
 	httpStep.End(nil)
 }
@@ -183,16 +201,14 @@ func testSiteToSite(t *testing.T, srOS vmtest.OSImage) {
 	t.Logf("response: %s", body)
 
 	if !strings.Contains(body, "Hello world I am backend-b") {
-		httpStep.End(fmt.Errorf("expected response from backend-b, got %q", body))
-		t.Fatalf("expected response from backend-b, got %q", body)
+		httpStep.Fatalf("expected response from backend-b, got %q", body)
 	}
 
 	// Verify the source IP was preserved. With --snat-subnet-routes=false,
 	// backend-b should see backend-a's LAN IP as the source, not sr-b's LAN IP.
 	backendAIP := backendA.LanIP(lanA).String()
 	if !strings.Contains(body, "from "+backendAIP) {
-		httpStep.End(fmt.Errorf("source IP not preserved: expected %q in response, got %q", backendAIP, body))
-		t.Fatalf("source IP not preserved: expected %q in response, got %q", backendAIP, body)
+		httpStep.Fatalf("source IP not preserved: expected %q in response, got %q", backendAIP, body)
 	}
 	httpStep.End(nil)
 }
@@ -229,12 +245,10 @@ func TestInterNetworkTCP(t *testing.T) {
 	body := env.HTTPGet(client, fmt.Sprintf("http://%s:8080/", webWAN))
 	t.Logf("response: %s", body)
 	if !strings.Contains(body, "Hello world I am webserver") {
-		httpStep.End(fmt.Errorf("unexpected response: %q", body))
-		t.Fatalf("unexpected response: %q", body)
+		httpStep.Fatalf("unexpected response: %q", body)
 	}
 	if !strings.Contains(body, "from "+clientWAN) {
-		httpStep.End(fmt.Errorf("expected source %q in response, got %q", clientWAN, body))
-		t.Fatalf("expected source %q in response, got %q", clientWAN, body)
+		httpStep.Fatalf("expected source %q in response, got %q", clientWAN, body)
 	}
 	httpStep.End(nil)
 }
@@ -293,12 +307,10 @@ func TestSubnetRouterPublicIP(t *testing.T) {
 		body := env.HTTPGet(client, webURL)
 		t.Logf("[%s] response: %s", label, body)
 		if !strings.Contains(body, "Hello world I am webserver") {
-			step.End(fmt.Errorf("[%s] unexpected webserver response: %q", label, body))
-			t.Fatalf("[%s] unexpected webserver response: %q", label, body)
+			step.Fatalf("[%s] unexpected webserver response: %q", label, body)
 		}
 		if !strings.Contains(body, "from "+wantSrc) {
-			step.End(fmt.Errorf("[%s] expected source %q in response, got %q", label, wantSrc, body))
-			t.Fatalf("[%s] expected source %q in response, got %q", label, wantSrc, body)
+			step.Fatalf("[%s] expected source %q in response, got %q", label, wantSrc, body)
 		}
 		step.End(nil)
 	}
@@ -443,15 +455,11 @@ func TestTaildrop(t *testing.T) {
 
 	verifyStep.Begin()
 	if gotName != filename {
-		err := fmt.Errorf("received name = %q; want %q", gotName, filename)
-		verifyStep.End(err)
-		t.Error(err)
+		verifyStep.Fatalf("received name = %q; want %q", gotName, filename)
 		return
 	}
 	if !bytes.Equal(gotContent, want) {
-		err := fmt.Errorf("received content = %q; want %q", gotContent, want)
-		verifyStep.End(err)
-		t.Error(err)
+		verifyStep.Fatalf("received content = %q; want %q", gotContent, want)
 		return
 	}
 	verifyStep.End(nil)
@@ -527,12 +535,10 @@ func TestExitNode(t *testing.T) {
 			body := env.HTTPGet(client, webURL)
 			t.Logf("response: %s", body)
 			if !strings.Contains(body, "Hello world I am webserver") {
-				tt.step.End(fmt.Errorf("unexpected webserver response: %q", body))
-				t.Fatalf("unexpected webserver response: %q", body)
+				tt.step.Fatalf("unexpected webserver response: %q", body)
 			}
 			if !strings.Contains(body, "from "+tt.wantSrc) {
-				tt.step.End(fmt.Errorf("expected source %q in response, got %q", tt.wantSrc, body))
-				t.Fatalf("expected source %q in response, got %q", tt.wantSrc, body)
+				tt.step.Fatalf("expected source %q in response, got %q", tt.wantSrc, body)
 			}
 			tt.step.End(nil)
 		})
@@ -659,8 +665,7 @@ func TestDiscoKeyChange(t *testing.T) {
 
 	pingABStep.Begin()
 	if err := env.Ping(a, b, tailcfg.PingTSMP, 30*time.Second); err != nil {
-		pingABStep.End(err)
-		t.Fatal(err)
+		pingABStep.Fatal(err)
 	}
 	pingABStep.End(nil)
 
@@ -704,9 +709,7 @@ func checkDiscoRotated(t *testing.T, env *vmtest.Env, a, b, pingFrom, pingTo *vm
 	verifyStep.Begin()
 	bSt := env.Status(b)
 	if got := bSt.Self.PublicKey; got != bNodeKey {
-		err := fmt.Errorf("[%s] b's node key changed: %v -> %v", label, bNodeKey, got)
-		verifyStep.End(err)
-		t.Fatal(err)
+		verifyStep.Fatalf("[%s] b's node key changed: %v -> %v", label, bNodeKey, got)
 	}
 	var newDisco key.DiscoPublic
 	if err := tstest.WaitFor(15*time.Second, func() error {
@@ -720,8 +723,7 @@ func checkDiscoRotated(t *testing.T, env *vmtest.Env, a, b, pingFrom, pingTo *vm
 		newDisco = n.DiscoKey
 		return nil
 	}); err != nil {
-		verifyStep.End(err)
-		t.Fatalf("[%s] %v", label, err)
+		verifyStep.Fatalf("[%s] %v", label, err)
 	}
 	t.Logf("[b] after %s: nodekey=%s discokey=%s", label, bNodeKey.ShortString(), newDisco.ShortString())
 	verifyStep.End(nil)
@@ -882,12 +884,10 @@ func TestMullvadExitNode(t *testing.T) {
 		body := env.HTTPGet(client, webURL)
 		t.Logf("[%s] response: %s", label, body)
 		if !strings.Contains(body, "Hello world I am webserver") {
-			step.End(fmt.Errorf("[%s] unexpected webserver response: %q", label, body))
-			t.Fatalf("[%s] unexpected webserver response: %q", label, body)
+			step.Fatalf("[%s] unexpected webserver response: %q", label, body)
 		}
 		if !strings.Contains(body, "from "+wantSrc) {
-			step.End(fmt.Errorf("[%s] expected source %q in response, got %q", label, wantSrc, body))
-			t.Fatalf("[%s] expected source %q in response, got %q", label, wantSrc, body)
+			step.Fatalf("[%s] expected source %q in response, got %q", label, wantSrc, body)
 		}
 		step.End(nil)
 	}
@@ -906,6 +906,20 @@ func TestMullvadExitNode(t *testing.T) {
 	// directions.
 	env.SetExitNodeIP(client, netip.Addr{})
 	check(checkOff2Step, "exit-off (again)", clientWAN)
+}
+
+// checkClientMetrics verifies that each entry in want exists and has the given
+// value in metrics.
+func checkClientMetrics(t *testing.T, label string, metrics vmtest.ClientMetrics, want map[string]int64) {
+	t.Helper()
+	for name, wantValue := range want {
+		got, ok := metrics[name]
+		if !ok {
+			t.Errorf("%s: required metric %q not found", label, name)
+		} else if got.Value != wantValue {
+			t.Errorf("%s: metric %q: got %v, want %v", label, name, got.Value, wantValue)
+		}
+	}
 }
 
 // TestCachedNetmapAfterRestart verifies that two nodes with netmap
@@ -936,8 +950,7 @@ func TestCachedNetmapAfterRestart(t *testing.T) {
 
 	connectStep.Begin()
 	if err := env.Ping(a, b, tailcfg.PingTSMP, 30*time.Second); err != nil {
-		connectStep.End(err)
-		t.Fatal(err)
+		connectStep.Fatal(err)
 	}
 	connectStep.End(nil)
 
@@ -959,20 +972,27 @@ func TestCachedNetmapAfterRestart(t *testing.T) {
 	for _, node := range []*vmtest.Node{a, b} {
 		nm, err := local.GetDebugResultJSON[netmap.NetworkMap](t.Context(), node.Agent().Client, "current-netmap")
 		if err != nil {
-			netmapCheckStep.End(fmt.Errorf("[%s] got err fetching netmap %q", node.Name(), err))
-			t.Fatalf("[%s] got err fetching netmap %q", node.Name(), err)
+			netmapCheckStep.Fatalf("[%s] got err fetching netmap %q", node.Name(), err)
 		}
 		if !nm.Cached {
-			netmapCheckStep.End(fmt.Errorf("[%s] expected netmap.Cached = true, got: %t", node.Name(), nm.Cached))
-			t.Fatalf("[%s] expected netmap.Cached = true, got: %t", node.Name(), nm.Cached)
+			netmapCheckStep.Fatalf("[%s] expected netmap.Cached = true, got: %t", node.Name(), nm.Cached)
 		}
 	}
 	netmapCheckStep.End(nil)
 
+	// 90s is generous on purpose. After both nodes restart with stale cached
+	// netmap entries, a's first WG handshake to b's pre-restart endpoint
+	// hits the dead NAT mapping on b's side and is silently dropped (we
+	// see this as "no recent outgoing packet" NAT drops in the vnet log).
+	// Recovery then waits on wireguard-go's REKEY_TIMEOUT (~5s) before the
+	// next handshake attempt, and on disco-via-DERP to teach each side the
+	// other's new endpoint. On an idle host this converges in well under
+	// 15s; on a contended host (a 14/16-CPU-loaded local repro, or any
+	// shared CI runner) the same sequence has been observed at 50-60s
+	// because every timer fires multiple times under scheduling jitter.
 	pingStep.Begin()
-	if err := env.Ping(a, b, tailcfg.PingTSMP, 30*time.Second); err != nil {
-		pingStep.End(err)
-		t.Fatal(err)
+	if err := env.Ping(a, b, tailcfg.PingTSMP, 90*time.Second); err != nil {
+		pingStep.Fatal(err)
 	}
 	pingStep.End(nil)
 }
@@ -995,12 +1015,22 @@ func TestDirectConnectionWithCachedNetmapOnOneNode(t *testing.T) {
 		vmtest.OS(vmtest.Gokrazy),
 		tailcfg.NodeCapMap{tailcfg.NodeAttrCacheNetworkMaps: nil})
 
+	checkInitialMetrics := env.AddStep("Check initial client metrics")
 	cutControlStep := env.AddStep("Cut control server access")
 	restartStep := env.AddStep("Restart tailscaled on a")
 	tsmpPingStep := env.AddStep("Ping a → b TSMP (cached netmap, no control)")
-	DiscoPingStep := env.AddStep("Ping a → b Disco (want Direct)")
+	discoPingStep := env.AddStep("Ping a → b Disco (want Direct)")
+	checkFinalMetrics := env.AddStep("Check final client metrics")
 
 	env.Start()
+
+	// Before: Verify that we have not recorded any cached contacts.
+	checkInitialMetrics.Begin()
+	checkClientMetrics(t, "Node A", env.ClientMetrics(a), map[string]int64{
+		"magicsock_cached_peer_contact_derp":   0,
+		"magicsock_cached_peer_contact_direct": 0,
+	})
+	checkInitialMetrics.End(nil)
 
 	cutControlStep.Begin()
 	a.DropControlTraffic()
@@ -1017,15 +1047,144 @@ func TestDirectConnectionWithCachedNetmapOnOneNode(t *testing.T) {
 
 	tsmpPingStep.Begin()
 	if err := env.Ping(a, b, tailcfg.PingTSMP, 30*time.Second); err != nil {
-		tsmpPingStep.End(err)
-		t.Fatal(err)
+		tsmpPingStep.Fatal(err)
 	}
 	tsmpPingStep.End(nil)
 
-	DiscoPingStep.Begin()
+	discoPingStep.Begin()
 	if err := env.PingExpect(a, b, vmtest.PingRouteDirect, 30*time.Second); err != nil {
-		DiscoPingStep.End(err)
-		t.Fatal(err)
+		discoPingStep.Fatal(err)
 	}
-	DiscoPingStep.End(nil)
+	discoPingStep.End(nil)
+
+	// After: Verify that we recorded a direct contact on the disconnected node.
+	checkFinalMetrics.Begin()
+	checkClientMetrics(t, "Node A", env.ClientMetrics(a), map[string]int64{
+		"magicsock_cached_peer_contact_direct": 1,
+	})
+	checkFinalMetrics.End(nil)
+}
+
+// TestPeerRelay verifies that two Tailscale nodes whose direct UDP path is
+// impossible at the network layer (both behind HardNAT, with no port-mapping
+// services on either of their networks) can still communicate via a third
+// Tailscale node configured as a peer-relay server.
+//
+// Topology:
+//
+//	a     (gokrazy, HardNAT)     — aNet      WAN 1.0.0.1
+//	b     (gokrazy, HardNAT)     — bNet      WAN 2.0.0.1
+//	relay (gokrazy, One2OneNAT)  — relayNet  WAN 3.0.0.1
+//
+// HardNAT in natlab is endpoint-dependent (each (src, dst) tuple gets a fresh
+// outbound port, and the inbound table keys on (wanPort, src)). Without
+// NAT-PMP/UPnP a→b and b→a direct UDP paths cannot be established. The relay
+// uses One2OneNAT so its STUN-discovered WAN endpoint is reachable from both
+// peers. The test then asserts that magicsock chose the peer-relay path
+// (not DERP) and that the relay reports the session.
+func TestPeerRelay(t *testing.T) {
+	env := vmtest.New(t, vmtest.PeerRelayGrants())
+
+	aNet := env.AddNetwork("1.0.0.1", "192.168.1.1/24", vnet.HardNAT)
+	bNet := env.AddNetwork("2.0.0.1", "192.168.2.1/24", vnet.HardNAT)
+	relayNet := env.AddNetwork("3.0.0.1", "192.168.3.1/24", vnet.One2OneNAT)
+
+	a := env.AddNode("a", aNet, vmtest.OS(vmtest.Gokrazy))
+	b := env.AddNode("b", bNet, vmtest.OS(vmtest.Gokrazy))
+	relay := env.AddNode("relay", relayNet, vmtest.OS(vmtest.Gokrazy))
+
+	enableRelayStep := env.AddStep("Enable peer-relay server on relay")
+	pingStep := env.AddStep("Disco ping a → b (want peer-relay path)")
+	sessionsStep := env.AddStep("Check DebugPeerRelaySessions on relay")
+
+	env.Start()
+
+	// Turn on the relay server. Port 0 picks an unused port.
+	enableRelayStep.Begin()
+	editCtx, editCancel := context.WithTimeout(t.Context(), 30*time.Second)
+	_, err := relay.Agent().EditPrefs(editCtx, &ipn.MaskedPrefs{
+		Prefs:              ipn.Prefs{RelayServerPort: new(uint16(0))},
+		RelayServerPortSet: true,
+	})
+	editCancel()
+	if err != nil {
+		enableRelayStep.Fatalf("EditPrefs(relay, RelayServerPort=0): %v", err)
+	}
+	enableRelayStep.End(nil)
+
+	// Wait for the relay to start, peers to learn about it via netmap,
+	// and the a→b disco ping to traverse it.
+	// PingResult.PeerRelay is set by magicsock to "ip:port:vni:N" when the
+	// disco probe rode a peer relay (vs Endpoint for direct UDP or
+	// DERPRegionID for DERP).
+	pingStep.Begin()
+	bIP := env.Status(b).Self.TailscaleIPs[0]
+	var lastDetail string
+	err = tstest.WaitFor(60*time.Second, func() error {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		pr, err := a.Agent().PingWithOpts(ctx, bIP, tailcfg.PingDisco, local.PingOpts{})
+		if err != nil {
+			return fmt.Errorf("ping: %w", err)
+		}
+		if pr.Err != "" {
+			return fmt.Errorf("ping err: %s", pr.Err)
+		}
+		if pr.PeerRelay == "" {
+			lastDetail = fmt.Sprintf("endpoint=%q derp=%d", pr.Endpoint, pr.DERPRegionID)
+			return fmt.Errorf("ping did not use a peer relay; %s", lastDetail)
+		}
+		t.Logf("a → b disco ping rode peer-relay %s", pr.PeerRelay)
+		return nil
+	})
+	if err != nil {
+		env.DumpStatus(a)
+		env.DumpStatus(b)
+		env.DumpStatus(relay)
+		pingStep.Fatalf("waiting for peer-relay path a → b: %v (last: %s)", err, lastDetail)
+	}
+	pingStep.End(nil)
+
+	// The relay's local debug-peer-relay-sessions LocalAPI should now
+	// report a single session for the a↔b disco probe. Cross-check the
+	// session's client disco keys against control's view of a and b, and
+	// confirm both sides recorded non-zero packet/byte counts (the disco
+	// ping + pong each take one underlay packet through the relay).
+	sessionsStep.Begin()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	srv, err := relay.Agent().DebugPeerRelaySessions(ctx)
+	if err != nil {
+		sessionsStep.Fatalf("DebugPeerRelaySessions: %v", err)
+	}
+	if srv.UDPPort == nil {
+		sessionsStep.Fatalf("relay UDPPort is nil; want set")
+	}
+	if got, want := len(srv.Sessions), 1; got != want {
+		sessionsStep.Fatalf("relay sessions = %d; want %d: %+v", got, want, srv.Sessions)
+	}
+	cs := env.ControlServer()
+	wantShorts := set.Of(
+		cs.Node(env.Status(a).Self.PublicKey).DiscoKey.ShortString(),
+		cs.Node(env.Status(b).Self.PublicKey).DiscoKey.ShortString(),
+	)
+	session := srv.Sessions[0]
+	gotShorts := set.Of(session.Client1.ShortDisco, session.Client2.ShortDisco)
+	if !gotShorts.Equal(wantShorts) {
+		sessionsStep.Fatalf("session disco shorts = %v; want %v", gotShorts, wantShorts)
+	}
+	for _, ci := range []status.ClientInfo{session.Client1, session.Client2} {
+		if !ci.Endpoint.IsValid() {
+			sessionsStep.Fatalf("session client %s: invalid Endpoint", ci.ShortDisco)
+		}
+		if ci.PacketsTx == 0 {
+			sessionsStep.Fatalf("session client %s: PacketsTx = 0; want >0", ci.ShortDisco)
+		}
+		if ci.BytesTx == 0 {
+			sessionsStep.Fatalf("session client %s: BytesTx = 0; want >0", ci.ShortDisco)
+		}
+	}
+	t.Logf("relay session VNI=%d %s <-> %s on UDP port %d",
+		session.VNI, session.Client1.ShortDisco, session.Client2.ShortDisco, *srv.UDPPort)
+	sessionsStep.End(nil)
 }

@@ -536,6 +536,8 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		needsCaptiveDetection: make(chan bool),
 	}
 
+	sys.NoiseRoundTripper.Set(noiseRoundTripper{b})
+
 	nb := newNodeBackend(ctx, b.logf, b.sys.Bus.Get())
 	b.currentNodeAtomic.Store(nb)
 	nb.ready()
@@ -1619,6 +1621,18 @@ func (b *LocalBackend) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeVi
 // ths current node.
 func (b *LocalBackend) PeerCaps(src netip.Addr) tailcfg.PeerCapMap {
 	return b.currentNode().PeerCaps(src)
+}
+
+// PeerCapsForIP returns the capabilities that remote src IP has when
+// talking to the given destination IP on this node.
+func (b *LocalBackend) PeerCapsForIP(src, dst netip.Addr) tailcfg.PeerCapMap {
+	return b.currentNode().PeerCapsForIP(src, dst)
+}
+
+// PeerCapsForService returns the capabilities that remote src IP has when
+// talking to the named VIP service on this node.
+func (b *LocalBackend) PeerCapsForService(src netip.Addr, svcName tailcfg.ServiceName) tailcfg.PeerCapMap {
+	return b.currentNode().PeerCapsForService(src, svcName)
 }
 
 // PeerByID returns the current full [tailcfg.Node] for the peer with the
@@ -5473,7 +5487,7 @@ func shouldUseOneCGNATRoute(logf logger.Logf, mon *netmon.Monitor, controlKnobs 
 			logf("shouldUseOneCGNATRoute: Could not determine if any interfaces use CGNAT: %v", err)
 			return false
 		}
-		logf("[v1] shouldUseOneCGNATRoute: macOS automatic=%v", !hasCGNATInterface)
+		logf("[v1] shouldUseOneCGNATRoute: %s automatic=%v", versionOS, !hasCGNATInterface)
 		if !hasCGNATInterface {
 			return true
 		}
@@ -6587,7 +6601,11 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	b.currentNode().SetNetMap(nm)
 	if ms, ok := b.sys.MagicSock.GetOK(); ok {
 		if nm != nil {
-			ms.SetNetworkMap(nm.SelfNode, nm.Peers)
+			if nm.Cached {
+				ms.SetNetworkMapCached(nm.SelfNode, nm.Peers)
+			} else {
+				ms.SetNetworkMap(nm.SelfNode, nm.Peers)
+			}
 		} else {
 			ms.SetNetworkMap(tailcfg.NodeView{}, nil)
 		}
@@ -7256,6 +7274,15 @@ func (b *LocalBackend) DoNoiseRequest(req *http.Request) (*http.Response, error)
 		return nil, errors.New("no client")
 	}
 	return cc.DoNoiseRequest(req)
+}
+
+// noiseRoundTripper adapts LocalBackend.DoNoiseRequest to http.RoundTripper.
+type noiseRoundTripper struct {
+	lb *LocalBackend
+}
+
+func (n noiseRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return n.lb.DoNoiseRequest(req)
 }
 
 // ActiveSSHConns returns the number of active SSH connections,
