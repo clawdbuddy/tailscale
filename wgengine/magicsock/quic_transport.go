@@ -1,0 +1,503 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
+package magicsock
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"io"
+	"math/big"
+	"net"
+	"net/netip"
+	"sync"
+	"time"
+
+	"github.com/clawdbuddy/wireguard-go/conn"
+	"github.com/quic-go/quic-go"
+
+	"tailscale.com/envknob"
+	"tailscale.com/types/key"
+)
+
+const (
+	quicPortOffset        = 1
+	quicIdleTimeout       = 5 * time.Minute
+	quicKeepAlive         = 30 * time.Second
+	quicDialTimeout       = 10 * time.Second
+	quicRecvBufSize = 256
+)
+
+var quicTransportEnabled = envknob.RegisterBool("TS_QUIC_TRANSPORT")
+
+type quicSession struct {
+	conn      quic.Connection
+	pubKey    key.NodePublic
+	closeOnce sync.Once
+	done      chan struct{}
+}
+
+func (s *quicSession) Close() {
+	s.closeOnce.Do(func() {
+		close(s.done)
+		s.conn.CloseWithError(0, "closing")
+	})
+}
+
+type quicPacket struct {
+	data []byte
+	ep   *endpoint
+}
+
+type quicTransport struct {
+	mu       sync.Mutex
+	listener *quic.Listener
+	udpConn  *net.UDPConn
+	port     uint16
+
+	sessions map[key.NodePublic]*quicSession
+
+	handshakeCh chan quicPacket
+	transportCh chan quicPacket
+
+	tlsConfig  *tls.Config
+	quicConfig *quic.Config
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	conn     *Conn
+	closed   bool
+}
+
+func newQUICTransport(c *Conn, wgPort uint16) (*quicTransport, error) {
+	if !quicTransportEnabled() {
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	qt := &quicTransport{
+		sessions:    make(map[key.NodePublic]*quicSession),
+		handshakeCh: make(chan quicPacket, quicRecvBufSize),
+		transportCh: make(chan quicPacket, quicRecvBufSize),
+		tlsConfig:   newQUICTLSConfig(),
+		quicConfig: &quic.Config{
+			HandshakeIdleTimeout: quicDialTimeout,
+			MaxIdleTimeout:       quicIdleTimeout,
+			KeepAlivePeriod:      quicKeepAlive,
+			MaxIncomingStreams:   64,
+			EnableDatagrams:      true,
+		},
+		ctx:    ctx,
+		cancel: cancel,
+		conn:   c,
+	}
+
+	quicPort := wgPort + quicPortOffset
+	addr := netip.AddrPortFrom(netip.IPv6Unspecified(), quicPort)
+	udpAddr := net.UDPAddrFromAddrPort(addr)
+
+	udpConn, err := net.ListenUDP(udpAddr.Network(), udpAddr)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	qt.udpConn = udpConn
+	qt.port = uint16(udpConn.LocalAddr().(*net.UDPAddr).Port)
+
+	ln, err := quic.Listen(udpConn, qt.tlsConfig, qt.quicConfig)
+	if err != nil {
+		udpConn.Close()
+		cancel()
+		return nil, err
+	}
+	qt.listener = ln
+
+	qt.wg.Add(1)
+	go qt.acceptLoop()
+
+	return qt, nil
+}
+
+func (qt *quicTransport) Close() {
+	if qt == nil {
+		return
+	}
+
+	qt.mu.Lock()
+	if qt.closed {
+		qt.mu.Unlock()
+		return
+	}
+	qt.closed = true
+	sessions := make([]*quicSession, 0, len(qt.sessions))
+	for _, s := range qt.sessions {
+		sessions = append(sessions, s)
+	}
+	qt.mu.Unlock()
+
+	qt.cancel()
+
+	for _, s := range sessions {
+		s.closeOnce.Do(func() {
+			close(s.done)
+			s.conn.CloseWithError(0, "closing")
+		})
+	}
+
+	qt.wg.Wait()
+
+	qt.mu.Lock()
+	qt.sessions = make(map[key.NodePublic]*quicSession)
+	qt.mu.Unlock()
+
+	if qt.listener != nil {
+		qt.listener.Close()
+	}
+	if qt.udpConn != nil {
+		qt.udpConn.Close()
+	}
+}
+
+func (qt *quicTransport) acceptLoop() {
+	defer qt.wg.Done()
+
+	for {
+		conn, err := qt.listener.Accept(qt.ctx)
+		if err != nil {
+			return
+		}
+
+		raddr := conn.RemoteAddr()
+		udpAddr := raddr.(*net.UDPAddr)
+		addrPort := udpAddr.AddrPort()
+
+		session := &quicSession{
+			conn: conn,
+			done: make(chan struct{}),
+		}
+
+		src := addrPort
+		ep := qt.conn.findOrCreateEndpointForQUIC(src)
+		if ep == nil {
+			conn.CloseWithError(0, "unknown peer")
+			continue
+		}
+
+		pk := ep.publicKey
+		qt.mu.Lock()
+		qt.sessions[pk] = session
+		qt.mu.Unlock()
+
+		qt.wg.Add(1)
+		go qt.sessionReadLoop(session, ep)
+	}
+}
+
+func (qt *quicTransport) getOrCreateSession(pubKey key.NodePublic, addr netip.AddrPort) (*quicSession, error) {
+	qt.mu.Lock()
+	if s, ok := qt.sessions[pubKey]; ok {
+		qt.mu.Unlock()
+		return s, nil
+	}
+	qt.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(qt.ctx, quicDialTimeout)
+	defer cancel()
+
+	quicAddr := netip.AddrPortFrom(addr.Addr(), addr.Port()+quicPortOffset)
+	conn, err := quic.DialAddr(ctx, quicAddr.String(), qt.tlsConfig, qt.quicConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	session := &quicSession{
+		conn:   conn,
+		pubKey: pubKey,
+		done:   make(chan struct{}),
+	}
+
+	qt.mu.Lock()
+	qt.sessions[pubKey] = session
+	qt.mu.Unlock()
+
+	qt.wg.Add(1)
+	go qt.sessionReadLoop(session, nil)
+
+	return session, nil
+}
+
+func (qt *quicTransport) resolveEndpointByKey(pubKey key.NodePublic) *endpoint {
+	qt.conn.mu.Lock()
+	defer qt.conn.mu.Unlock()
+	e, ok := qt.conn.peerMap.endpointForNodeKey(pubKey)
+	if !ok {
+		return nil
+	}
+	return e
+}
+
+func (qt *quicTransport) sessionReadLoop(session *quicSession, ep *endpoint) {
+	defer qt.wg.Done()
+
+	streamCtx, streamCancel := context.WithCancel(qt.ctx)
+	defer streamCancel()
+
+	go qt.streamReader(session, streamCtx, ep)
+
+	for {
+		data, err := session.conn.ReceiveDatagram(qt.ctx)
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+				return
+			}
+			select {
+			case <-qt.ctx.Done():
+				return
+			default:
+				continue
+			}
+		}
+
+		msg := make([]byte, len(data))
+		copy(msg, data)
+
+		if ep == nil {
+			ep = qt.resolveEndpointByKey(session.pubKey)
+		}
+		if ep == nil {
+			continue
+		}
+
+		pkt := quicPacket{data: msg, ep: ep}
+		select {
+		case qt.transportCh <- pkt:
+		default:
+		}
+	}
+}
+
+func (qt *quicTransport) streamReader(session *quicSession, ctx context.Context, ep *endpoint) {
+	for {
+		stream, err := session.conn.AcceptUniStream(ctx)
+		if err != nil {
+			return
+		}
+
+		go func(s quic.ReceiveStream) {
+			defer s.CancelRead(0)
+
+			data, err := io.ReadAll(s)
+			if err != nil || len(data) == 0 {
+				return
+			}
+
+			msg := make([]byte, len(data))
+			copy(msg, data)
+
+			currentEP := ep
+			if currentEP == nil {
+				currentEP = qt.resolveEndpointByKey(session.pubKey)
+			}
+			if currentEP == nil {
+				return
+			}
+
+			select {
+			case qt.handshakeCh <- quicPacket{data: msg, ep: currentEP}:
+			default:
+			}
+		}(stream)
+	}
+}
+
+func (qt *quicTransport) sendToPeer(pubKey key.NodePublic, wgAddr netip.AddrPort, buffs [][]byte, offset int) error {
+	session, err := qt.getOrCreateSession(pubKey, wgAddr)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-session.done:
+		qt.mu.Lock()
+		delete(qt.sessions, pubKey)
+		qt.mu.Unlock()
+		return errors.New("QUIC session closed")
+	default:
+	}
+
+	for _, buf := range buffs {
+		if len(buf) <= offset {
+			continue
+		}
+		msg := buf[offset:]
+		if len(msg) == 0 {
+			continue
+		}
+
+		msgType := msg[0]
+
+		switch {
+		case msgType >= conn.MessageInitiationType && msgType <= conn.MessageCookieReplyType:
+			if err := qt.sendHandshake(session, msg); err != nil {
+				return err
+			}
+		case msgType == conn.MessageTransportType:
+			if err := session.conn.SendDatagram(msg); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (qt *quicTransport) sendHandshake(session *quicSession, msg []byte) error {
+	ctx, cancel := context.WithTimeout(qt.ctx, quicDialTimeout)
+	defer cancel()
+
+	stream, err := session.conn.OpenUniStreamSync(ctx)
+	if err != nil {
+		return err
+	}
+
+	if _, err := stream.Write(msg); err != nil {
+		stream.Close()
+		return err
+	}
+
+	return stream.Close()
+}
+
+func (qt *quicTransport) receiveHandshake() conn.ReceiveFunc {
+	return func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+		for i := range packets {
+			packets[i] = packets[i][:cap(packets[i])]
+		}
+
+		select {
+		case pkt, ok := <-qt.handshakeCh:
+			if !ok {
+				return 0, net.ErrClosed
+			}
+			n := copy(packets[0], pkt.data)
+			sizes[0] = n
+			eps[0] = pkt.ep
+
+			count := 1
+			for i := 1; i < len(packets); i++ {
+				select {
+				case pkt, ok := <-qt.handshakeCh:
+					if !ok {
+						return count, nil
+					}
+					n := copy(packets[i], pkt.data)
+					sizes[i] = n
+					eps[i] = pkt.ep
+					count++
+				default:
+					return count, nil
+				}
+			}
+			return count, nil
+
+		case <-qt.ctx.Done():
+			return 0, net.ErrClosed
+		}
+	}
+}
+
+func (qt *quicTransport) receiveTransport() conn.ReceiveFunc {
+	return func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+		for i := range packets {
+			packets[i] = packets[i][:cap(packets[i])]
+		}
+
+		select {
+		case pkt, ok := <-qt.transportCh:
+			if !ok {
+				return 0, net.ErrClosed
+			}
+			n := copy(packets[0], pkt.data)
+			sizes[0] = n
+			eps[0] = pkt.ep
+
+			count := 1
+			for i := 1; i < len(packets); i++ {
+				select {
+				case pkt, ok := <-qt.transportCh:
+					if !ok {
+						return count, nil
+					}
+					n := copy(packets[i], pkt.data)
+					sizes[i] = n
+					eps[i] = pkt.ep
+					count++
+				default:
+					return count, nil
+				}
+			}
+			return count, nil
+
+		case <-qt.ctx.Done():
+			return 0, net.ErrClosed
+		}
+	}
+}
+
+func (qt *quicTransport) LocalPort() uint16 {
+	if qt == nil {
+		return 0
+	}
+	return qt.port
+}
+
+func (qt *quicTransport) Type() string {
+	if qt == nil {
+		return "none"
+	}
+	return "QUIC"
+}
+
+func (qt *quicTransport) Enabled() bool {
+	return qt != nil && !qt.closed
+}
+
+func newQUICTLSConfig() *tls.Config {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+
+	cert := tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  key,
+	}
+
+	return &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		NextProtos:         []string{"wireguard-quic"},
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS13,
+	}
+}

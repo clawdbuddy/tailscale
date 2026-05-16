@@ -217,6 +217,10 @@ type Conn struct {
 	// quicState holds QUIC obfuscation state.
 	quicState *quicState
 
+	// quicTransport manages QUIC connections for direct peer-to-peer transport.
+	// It is non-nil only when TS_QUIC_TRANSPORT is enabled.
+	quicTransport *quicTransport
+
 	// cloudInfo is used to query cloud metadata services.
 	cloudInfo *cloudinfo.CloudInfo
 
@@ -686,6 +690,13 @@ func NewConn(opts Options) (*Conn, error) {
 
 	if err := c.rebind(keepCurrentPort); err != nil {
 		return nil, err
+	}
+
+	if qt, err := newQUICTransport(c, c.LocalPort()); err != nil {
+		c.logf("magicsock: QUIC transport: %v", err)
+	} else if qt != nil {
+		c.quicTransport = qt
+		c.logf("magicsock: QUIC transport enabled on port %d", qt.LocalPort())
 	}
 
 	c.netChecker = &netcheck.Client{
@@ -3401,12 +3412,18 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 		return nil, 0, errors.New("magicsock: connBind already open")
 	}
 	c.closed = false
-	fns := []conn.ReceiveFunc{c.receiveIPv4(), c.receiveIPv6(), c.receiveDERP}
+
 	if runtime.GOOS == "js" {
-		fns = []conn.ReceiveFunc{c.receiveDERP}
+		return []conn.ReceiveFunc{c.receiveDERP}, c.LocalPort(), nil
 	}
-	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
-	// closure that closes over a *RebindingUDPConn?
+
+	fns := []conn.ReceiveFunc{c.receiveIPv4(), c.receiveIPv6(), c.receiveDERP}
+
+	qt := c.Conn.quicTransport
+	if qt != nil {
+		fns = append(fns, qt.receiveTransport(), qt.receiveHandshake())
+	}
+
 	return fns, c.LocalPort(), nil
 }
 
@@ -3437,6 +3454,11 @@ func (c *connBind) Close() error {
 	if c.closeDisco6 != nil {
 		c.closeDisco6.Close()
 	}
+
+	if c.Conn.quicTransport != nil {
+		c.Conn.quicTransport.Close()
+	}
+
 	// Send an empty read result to unblock receiveDERP,
 	// which will then check connBind.Closed.
 	// connBind.Closed takes c.mu, but c.derpRecvCh is buffered.
@@ -3492,6 +3514,9 @@ func (c *Conn) Close() error {
 	}
 	if c.closeDisco6 != nil {
 		c.closeDisco6.Close()
+	}
+	if c.quicTransport != nil {
+		c.quicTransport.Close()
 	}
 	// Wait on goroutines updating right at the end, once everything is
 	// already closed. We want everything else in the Conn to be
@@ -3769,6 +3794,18 @@ func (c *Conn) resetEndpointStates() {
 	c.peerMap.forEachEndpoint(func(ep *endpoint) {
 		ep.noteConnectivityChange()
 	})
+}
+
+// findOrCreateEndpointForQUIC looks up or creates an endpoint for QUIC connections.
+// It returns nil if no endpoint is known for the given address.
+func (c *Conn) findOrCreateEndpointForQUIC(src netip.AddrPort) *endpoint {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ep, ok := c.peerMap.endpointForEpAddr(epAddr{ap: src})
+	if !ok {
+		return nil
+	}
+	return ep
 }
 
 // packIPPort packs an IPPort into the form wanted by WireGuard.

@@ -1072,7 +1072,9 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	}
 	var err error
 	if udpAddr.ap.IsValid() {
-		if de.c.quicState.quicObfuscation.Load() {
+		if qt := de.c.quicTransport; qt != nil && qt.Enabled() {
+			err = qt.sendToPeer(de.publicKey, udpAddr.ap, buffs, offset)
+		} else if de.c.quicState.quicObfuscation.Load() {
 			cid := de.c.quicState.getConnectionID(de)
 			err = de.c.sendQUICDirect(udpAddr.ap, buffs, offset, cid)
 		} else {
