@@ -42,7 +42,7 @@ func TestStripQUICHeaderPreservesNonWireGuard(t *testing.T) {
 	wgTransportWrapped := make([]byte, quicShortHdrLen+len(wgTransport))
 	wgTransportWrapped[0] = 0x40
 	copy(wgTransportWrapped[1:9], []byte{1, 2, 3, 4, 5, 6, 7, 8})
-	binary.LittleEndian.PutUint16(wgTransportWrapped[9:11], uint16(0xdeadbeef))
+	binary.LittleEndian.PutUint16(wgTransportWrapped[9:11], uint16(0xbeef))
 	copy(wgTransportWrapped[quicShortHdrLen:], wgTransport)
 
 	// Build a valid wrapped QUIC long-header WG initiation packet.
