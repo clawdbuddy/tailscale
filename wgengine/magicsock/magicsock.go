@@ -2719,6 +2719,9 @@ func (c *Conn) SetPreferredPort(port uint16) {
 		c.logf("%v", err)
 		return
 	}
+	if c.quicTransport != nil {
+		c.quicTransport.Rebind(uint16(c.port.Load()))
+	}
 	c.resetEndpointStates()
 }
 
@@ -3125,6 +3128,10 @@ func (c *Conn) updateNodes(self tailcfg.NodeView, peers []tailcfg.NodeView) (pee
 				c.peerMap.deleteEndpoint(ep)
 			}
 		})
+		// Also clean up stale QUIC sessions for removed peers.
+		if c.quicTransport != nil {
+			c.quicTransport.RemovePeerSessions(keep)
+		}
 	}
 
 	// discokeys might have changed above. Discard unused info.
@@ -3322,6 +3329,11 @@ func (c *Conn) RemovePeer(nid tailcfg.NodeID) {
 		// Tell the relay manager to drop the peer. The run loop no-ops
 		// this if the peer wasn't a relay server.
 		c.relayManager.handleRelayServerRemove(prev.Key())
+	}
+
+	// Clean up any QUIC session for this peer.
+	if c.quicTransport != nil {
+		c.quicTransport.RemovePeerByKey(prev.Key())
 	}
 }
 
@@ -3794,6 +3806,10 @@ func (c *Conn) Rebind() {
 	if err := c.rebind(keepCurrentPort); err != nil {
 		c.logf("%v", err)
 		return
+	}
+
+	if c.quicTransport != nil {
+		c.quicTransport.Rebind(uint16(c.port.Load()))
 	}
 
 	var ifIPs []netip.Prefix

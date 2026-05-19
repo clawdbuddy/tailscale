@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/clawdbuddy/wireguard-go/conn"
@@ -23,6 +24,7 @@ import (
 
 	"tailscale.com/envknob"
 	"tailscale.com/types/key"
+	"tailscale.com/util/set"
 )
 
 const (
@@ -35,6 +37,11 @@ const (
 
 var quicTransportEnabled = envknob.RegisterBool("TS_QUIC_TRANSPORT")
 
+var (
+	errQUICSessionClosed = errors.New("QUIC session closed")
+	errQUICNotEnabled    = errors.New("QUIC transport not enabled")
+)
+
 type quicSession struct {
 	conn      quic.Connection
 	pubKey    key.NodePublic
@@ -45,7 +52,9 @@ type quicSession struct {
 func (s *quicSession) Close() {
 	s.closeOnce.Do(func() {
 		close(s.done)
-		s.conn.CloseWithError(0, "closing")
+		if s.conn != nil {
+			s.conn.CloseWithError(0, "closing")
+		}
 	})
 }
 
@@ -55,10 +64,11 @@ type quicPacket struct {
 }
 
 type quicTransport struct {
-	mu       sync.Mutex
-	listener *quic.Listener
-	udpConn  *net.UDPConn
-	port     uint16
+	mu         sync.Mutex
+	listener   *quic.Listener
+	qTransport *quic.Transport
+	udpConn    *net.UDPConn
+	port       uint16
 
 	sessions map[key.NodePublic]*quicSession
 
@@ -72,8 +82,12 @@ type quicTransport struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	conn     *Conn
-	closed   bool
+	conn   *Conn
+	closed bool
+
+	droppedTransports atomic.Int64
+	droppedHandshakes atomic.Int64
+	dropLogged        sync.Once
 }
 
 func newQUICTransport(c *Conn, wgPort uint16) (*quicTransport, error) {
@@ -101,6 +115,9 @@ func newQUICTransport(c *Conn, wgPort uint16) (*quicTransport, error) {
 	}
 
 	quicPort := wgPort + quicPortOffset
+	if wgPort == 0 {
+		quicPort = 0
+	}
 	addr := netip.AddrPortFrom(netip.IPv6Unspecified(), quicPort)
 	udpAddr := net.UDPAddrFromAddrPort(addr)
 
@@ -111,8 +128,9 @@ func newQUICTransport(c *Conn, wgPort uint16) (*quicTransport, error) {
 	}
 	qt.udpConn = udpConn
 	qt.port = uint16(udpConn.LocalAddr().(*net.UDPAddr).Port)
+	qt.qTransport = &quic.Transport{Conn: udpConn}
 
-	ln, err := quic.Listen(udpConn, qt.tlsConfig, qt.quicConfig)
+	ln, err := qt.qTransport.Listen(qt.tlsConfig, qt.quicConfig)
 	if err != nil {
 		udpConn.Close()
 		cancel()
@@ -146,10 +164,7 @@ func (qt *quicTransport) Close() {
 	qt.cancel()
 
 	for _, s := range sessions {
-		s.closeOnce.Do(func() {
-			close(s.done)
-			s.conn.CloseWithError(0, "closing")
-		})
+		s.Close()
 	}
 
 	qt.wg.Wait()
@@ -160,6 +175,9 @@ func (qt *quicTransport) Close() {
 
 	if qt.listener != nil {
 		qt.listener.Close()
+	}
+	if qt.qTransport != nil {
+		qt.qTransport.Close()
 	}
 	if qt.udpConn != nil {
 		qt.udpConn.Close()
@@ -178,6 +196,7 @@ func (qt *quicTransport) acceptLoop() {
 		raddr := conn.RemoteAddr()
 		udpAddr := raddr.(*net.UDPAddr)
 		addrPort := udpAddr.AddrPort()
+		addrPort = netip.AddrPortFrom(addrPort.Addr().Unmap(), addrPort.Port())
 
 		session := &quicSession{
 			conn: conn,
@@ -201,19 +220,13 @@ func (qt *quicTransport) acceptLoop() {
 	}
 }
 
-func (qt *quicTransport) getOrCreateSession(pubKey key.NodePublic, addr netip.AddrPort) (*quicSession, error) {
-	qt.mu.Lock()
-	if s, ok := qt.sessions[pubKey]; ok {
-		qt.mu.Unlock()
-		return s, nil
-	}
-	qt.mu.Unlock()
-
+func (qt *quicTransport) dialSession(pubKey key.NodePublic, addr netip.AddrPort) (*quicSession, error) {
 	ctx, cancel := context.WithTimeout(qt.ctx, quicDialTimeout)
 	defer cancel()
 
 	quicAddr := netip.AddrPortFrom(addr.Addr(), addr.Port()+quicPortOffset)
-	conn, err := quic.DialAddr(ctx, quicAddr.String(), qt.tlsConfig, qt.quicConfig)
+	udpAddr := net.UDPAddrFromAddrPort(quicAddr)
+	conn, err := qt.qTransport.Dial(ctx, udpAddr, qt.tlsConfig, qt.quicConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -232,6 +245,17 @@ func (qt *quicTransport) getOrCreateSession(pubKey key.NodePublic, addr netip.Ad
 	go qt.sessionReadLoop(session, nil)
 
 	return session, nil
+}
+
+func (qt *quicTransport) getOrCreateSession(pubKey key.NodePublic, addr netip.AddrPort) (*quicSession, error) {
+	qt.mu.Lock()
+	if s, ok := qt.sessions[pubKey]; ok {
+		qt.mu.Unlock()
+		return s, nil
+	}
+	qt.mu.Unlock()
+
+	return qt.dialSession(pubKey, addr)
 }
 
 func (qt *quicTransport) resolveEndpointByKey(pubKey key.NodePublic) *endpoint {
@@ -280,6 +304,8 @@ func (qt *quicTransport) sessionReadLoop(session *quicSession, ep *endpoint) {
 		select {
 		case qt.transportCh <- pkt:
 		default:
+			qt.droppedTransports.Add(1)
+			qt.logFirstDrop()
 		}
 	}
 }
@@ -313,6 +339,8 @@ func (qt *quicTransport) streamReader(session *quicSession, ctx context.Context,
 			select {
 			case qt.handshakeCh <- quicPacket{data: msg, ep: currentEP}:
 			default:
+				qt.droppedHandshakes.Add(1)
+				qt.logFirstDrop()
 			}
 		}(stream)
 	}
@@ -329,7 +357,10 @@ func (qt *quicTransport) sendToPeer(pubKey key.NodePublic, wgAddr netip.AddrPort
 		qt.mu.Lock()
 		delete(qt.sessions, pubKey)
 		qt.mu.Unlock()
-		return errors.New("QUIC session closed")
+		session, err = qt.dialSession(pubKey, wgAddr)
+		if err != nil {
+			return err
+		}
 	default:
 	}
 
@@ -357,6 +388,120 @@ func (qt *quicTransport) sendToPeer(pubKey key.NodePublic, wgAddr netip.AddrPort
 	}
 
 	return nil
+}
+
+// RemovePeerSessions closes and removes QUIC sessions for peers not in the
+// given set of node keys. Called from updateNodes during a network map update.
+func (qt *quicTransport) RemovePeerSessions(keep set.Set[key.NodePublic]) {
+	if qt == nil || !qt.Enabled() {
+		return
+	}
+	var toClose []*quicSession
+	qt.mu.Lock()
+	for pk, s := range qt.sessions {
+		if !keep.Contains(pk) {
+			delete(qt.sessions, pk)
+			toClose = append(toClose, s)
+		}
+	}
+	qt.mu.Unlock()
+	for _, s := range toClose {
+		s.Close()
+	}
+}
+
+// RemovePeerByKey closes and removes the QUIC session for a single peer.
+func (qt *quicTransport) RemovePeerByKey(pk key.NodePublic) {
+	if qt == nil || !qt.Enabled() {
+		return
+	}
+	qt.mu.Lock()
+	s, ok := qt.sessions[pk]
+	if ok {
+		delete(qt.sessions, pk)
+	}
+	qt.mu.Unlock()
+	if ok {
+		s.Close()
+	}
+}
+
+// Rebind closes and re-creates the QUIC listener and UDP socket. If wgPort is
+// non-zero, the QUIC port is set to wgPort+quicPortOffset. All existing
+// sessions are closed and will be re-established lazily via auto-reconnect.
+// Called when the parent magicsock Conn rebinds its UDP sockets (e.g. after a
+// network error or interface change).
+func (qt *quicTransport) Rebind(wgPort uint16) {
+	if qt == nil || !qt.Enabled() || qt.closed {
+		return
+	}
+
+	if wgPort != 0 {
+		qt.port = wgPort + quicPortOffset
+	} else if qt.port == 0 {
+		// With wgPort==0 the OS assigned the port, keep using it.
+	}
+
+	qt.conn.logf("magicsock: QUIC transport rebinding")
+
+	// Close the listener to unblock acceptLoop.
+	if qt.listener != nil {
+		qt.listener.Close()
+	}
+
+	// Close all existing sessions.
+	qt.mu.Lock()
+	sessions := make([]*quicSession, 0, len(qt.sessions))
+	for _, s := range qt.sessions {
+		sessions = append(sessions, s)
+	}
+	qt.sessions = make(map[key.NodePublic]*quicSession)
+	qt.mu.Unlock()
+
+	for _, s := range sessions {
+		s.Close()
+	}
+
+	// Wait for acceptLoop and sessionReadLoops to finish.
+	qt.wg.Wait()
+
+	// Close old transport and UDP conn.
+	if qt.qTransport != nil {
+		qt.qTransport.Close()
+		qt.qTransport = nil
+	}
+	if qt.udpConn != nil {
+		qt.udpConn.Close()
+		qt.udpConn = nil
+	}
+
+	// Re-create UDP socket on the same port.
+	addr := netip.AddrPortFrom(netip.IPv6Unspecified(), qt.port)
+	udpAddr := net.UDPAddrFromAddrPort(addr)
+	udpConn, err := net.ListenUDP(udpAddr.Network(), udpAddr)
+	if err != nil {
+		qt.conn.logf("magicsock: QUIC rebind: listen failed on %v: %v", addr, err)
+		return
+	}
+	qt.udpConn = udpConn
+	qt.port = uint16(udpConn.LocalAddr().(*net.UDPAddr).Port)
+	qt.qTransport = &quic.Transport{Conn: udpConn}
+
+	// Re-create QUIC listener.
+	ln, err := qt.qTransport.Listen(qt.tlsConfig, qt.quicConfig)
+	if err != nil {
+		qt.conn.logf("magicsock: QUIC rebind: listen failed: %v", err)
+		udpConn.Close()
+		qt.udpConn = nil
+		return
+	}
+	qt.listener = ln
+
+	// Restart accept loop.
+	qt.wg.Add(1)
+	go qt.acceptLoop()
+
+	qt.conn.logf("magicsock: QUIC transport rebound on port %d", qt.port)
 }
 
 func (qt *quicTransport) sendHandshake(session *quicSession, msg []byte) error {
@@ -468,6 +613,16 @@ func (qt *quicTransport) Type() string {
 
 func (qt *quicTransport) Enabled() bool {
 	return qt != nil && !qt.closed
+}
+
+func (qt *quicTransport) logFirstDrop() {
+	qt.dropLogged.Do(func() {
+		qt.conn.logf("magicsock: QUIC receive channel full, dropping packets")
+	})
+}
+
+func (qt *quicTransport) Stats() (droppedTransports, droppedHandshakes int64) {
+	return qt.droppedTransports.Load(), qt.droppedHandshakes.Load()
 }
 
 func newQUICTLSConfig() *tls.Config {

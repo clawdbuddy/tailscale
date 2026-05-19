@@ -1081,6 +1081,10 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	if udpAddr.ap.IsValid() {
 		if qt := de.c.quicTransport; qt != nil && qt.Enabled() {
 			err = qt.sendToPeer(de.publicKey, udpAddr.ap, buffs, offset)
+			if err != nil {
+				de.c.logf("[v2] magicsock: QUIC send to %s failed (%v); falling back to UDP", de.publicKey.ShortString(), err)
+				_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
+			}
 		} else if de.c.quicState.quicObfuscation.Load() {
 			cid := de.c.quicState.getConnectionID(de)
 			err = de.c.sendQUICDirect(udpAddr.ap, buffs, offset, cid)
