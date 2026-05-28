@@ -255,7 +255,23 @@ func (qt *quicTransport) getOrCreateSession(pubKey key.NodePublic, addr netip.Ad
 	}
 	qt.mu.Unlock()
 
-	return qt.dialSession(pubKey, addr)
+	// Dial without holding lock; another goroutine may have created
+	// a session while we were unlocked.
+	session, err := qt.dialSession(pubKey, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check whether another goroutine created a session first.
+	qt.mu.Lock()
+	if existing, ok := qt.sessions[pubKey]; ok {
+		// Another goroutine beat us; close our session and return the existing one.
+		session.Close()
+		qt.mu.Unlock()
+		return existing, nil
+	}
+	qt.mu.Unlock()
+	return session, nil
 }
 
 func (qt *quicTransport) resolveEndpointByKey(pubKey key.NodePublic) *endpoint {
@@ -449,7 +465,7 @@ func (qt *quicTransport) Rebind(wgPort uint16) {
 		qt.listener.Close()
 	}
 
-	// Close all existing sessions.
+	// Close all existing sessions and clear the receive channels.
 	qt.mu.Lock()
 	sessions := make([]*quicSession, 0, len(qt.sessions))
 	for _, s := range qt.sessions {
@@ -461,6 +477,26 @@ func (qt *quicTransport) Rebind(wgPort uint16) {
 	for _, s := range sessions {
 		s.Close()
 	}
+
+	// Drain the receive channels to prevent stale packets.
+	// This is safe because all senders (sessionReadLoop, streamReader) have been
+	// stopped via qt.wg.Wait() below.
+	for {
+		select {
+		case <-qt.handshakeCh:
+		default:
+			goto drainTransport
+		}
+	}
+drainTransport:
+	for {
+		select {
+		case <-qt.transportCh:
+		default:
+			goto doneDraining
+		}
+	}
+doneDraining:
 
 	// Wait for acceptLoop and sessionReadLoops to finish.
 	qt.wg.Wait()
@@ -491,8 +527,9 @@ func (qt *quicTransport) Rebind(wgPort uint16) {
 	ln, err := qt.qTransport.Listen(qt.tlsConfig, qt.quicConfig)
 	if err != nil {
 		qt.conn.logf("magicsock: QUIC rebind: listen failed: %v", err)
-		udpConn.Close()
-		qt.udpConn = nil
+		// Don't leave transport in broken state: keep the UDP socket bound.
+		// The old port is preserved in qt.port for the next Rebind attempt.
+		qt.listener = nil
 		return
 	}
 	qt.listener = ln
