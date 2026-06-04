@@ -3841,6 +3841,14 @@ func (c *Conn) resetEndpointStates() {
 // address. The QUIC listener binds to wgPort+1, so the peer's source port seen
 // here is wgPort+1, not the wgPort the endpoint is registered with — we adjust
 // before looking up.
+//
+// The peer's port can change between UDP and QUIC paths (e.g. carrier-grade
+// NAT, IPv6 prefix rotation, or simply because we have only ever seen the
+// peer via DERP). If the exact wgPort match misses, fall back to a
+// same-address match across all known endpoints, since the IP portion of an
+// endpoint is far more stable than the port. On a hit, register the new
+// wgPort in peerMap and update bestAddr so the next send to this peer lands
+// on the right port.
 func (c *Conn) findOrCreateEndpointForQUIC(src netip.AddrPort) *endpoint {
 	wgPort := uint16(0)
 	if src.Port() > 0 {
@@ -3848,12 +3856,50 @@ func (c *Conn) findOrCreateEndpointForQUIC(src netip.AddrPort) *endpoint {
 	}
 	wgAddr := netip.AddrPortFrom(src.Addr(), wgPort)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	ep, ok := c.peerMap.endpointForEpAddr(epAddr{ap: wgAddr})
-	if !ok {
+	if ep, ok := c.peerMap.endpointForEpAddr(epAddr{ap: wgAddr}); ok {
+		c.mu.Unlock()
+		return ep
+	}
+	// Fallback: match by address (ignoring port). Walk all known peer
+	// endpoints and look for one with the same IP in any of its
+	// endpointState entries.
+	srcAddr := src.Addr()
+	var matchedEP *endpoint
+	var matchedNK key.NodePublic
+	for nk, pi := range c.peerMap.byNodeKey {
+		for ipp := range pi.ep.endpointState {
+			if ipp.Addr() == srcAddr {
+				matchedEP = pi.ep
+				matchedNK = nk
+				break
+			}
+		}
+		if matchedEP != nil {
+			break
+		}
+	}
+	if matchedEP == nil {
+		c.mu.Unlock()
 		return nil
 	}
-	return ep
+	// Teach peerMap the new wgPort for this peer so subsequent dials
+	// target the right port.
+	c.peerMap.setNodeKeyForEpAddr(epAddr{ap: wgAddr}, matchedNK)
+	// Capture the old bestAddr while still holding c.mu for the log line.
+	oldBest := matchedEP.bestAddr.epAddr.ap
+	c.mu.Unlock()
+	// Update bestAddr under endpoint.mu so the next sendToPeer dials
+	// the right port. bestAddrAt/trustBestAddrUntil aren't critical for
+	// the dial, but we set a short trust window so the immediate
+	// follow-up send lands on the new port.
+	matchedEP.mu.Lock()
+	if matchedEP.bestAddr.epAddr.ap != wgAddr {
+		matchedEP.setBestAddrLocked(addrQuality{epAddr: epAddr{ap: wgAddr}})
+	}
+	matchedEP.trustBestAddrUntil = mono.Now().Add(30 * time.Second)
+	matchedEP.mu.Unlock()
+	c.logf("magicsock: QUIC accept: peer %s seen at new wgPort=%d (was %v); peerMap+bestAddr updated", matchedNK.ShortString(), wgPort, oldBest)
+	return matchedEP
 }
 
 // packIPPort packs an IPPort into the form wanted by WireGuard.
