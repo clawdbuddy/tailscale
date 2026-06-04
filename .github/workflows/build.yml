@@ -62,9 +62,9 @@ jobs:
           VERSION_GIT_HASH: ${{ env.VERSION }}
         run: |
           ./build_dist.sh tailscale.com/cmd/tailscale
-          mv tailscale tailscale${{ matrix.ext }}
+          if [ -n "${{ matrix.ext }}" ]; then mv tailscale tailscale${{ matrix.ext }}; fi
           ./build_dist.sh tailscale.com/cmd/tailscaled
-          mv tailscaled tailscaled${{ matrix.ext }}
+          if [ -n "${{ matrix.ext }}" ]; then mv tailscaled tailscaled${{ matrix.ext }}; fi
 
       - name: Package .deb (Linux)
         if: matrix.pkg == 'deb'
