@@ -1,0 +1,40 @@
+# Copyright (c) Tailscale Inc & contributors
+# SPDX-License-Identifier: BSD-3-Clause
+
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    iptables \
+    iproute2 \
+    curl \
+    net-tools \
+    iputils-ping \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r tailscale \
+    && useradd -r -m -s /bin/false -g tailscale tailscale
+
+# Create required directories
+RUN mkdir -p /var/run/tailscale /var/lib/tailscale /tailscale
+
+# Copy tailscale binaries from local build
+COPY ts-bin/tailscaled /usr/local/bin/
+COPY ts-bin/tailscale /usr/local/bin/
+
+# Set environment variables for QUIC transport
+ENV TS_QUIC_TRANSPORT=1
+
+# Expose tailscaled socket and port
+EXPOSE 80
+
+# Default: run tailscaled with real TUN device for full WireGuard support
+# Requires: --device=/dev/net/tun --cap-add=NET_ADMIN --cap-add=SYS_ADMIN
+# Example:
+#   docker run -d --name ts1 \
+#     --device=/dev/net/tun \
+#     --cap-add=NET_ADMIN \
+#     --cap-add=SYS_ADMIN \
+#     --privileged \
+#     tailscale:local
+ENTRYPOINT ["/usr/local/bin/tailscaled"]
+CMD ["--verbose=1", "--socket=/var/run/tailscale/tailscaled.sock", "--tun=tailscale0"]

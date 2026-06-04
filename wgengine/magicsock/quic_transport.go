@@ -27,12 +27,54 @@ import (
 	"tailscale.com/util/set"
 )
 
+// isQUICClosingErr reports whether err is a QUIC-level close error
+// that should terminate the session read loop.
+func isQUICClosingErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var appErr *quic.ApplicationError
+	if errors.As(err, &appErr) {
+		return true
+	}
+	var idleErr *quic.IdleTimeoutError
+	if errors.As(err, &idleErr) {
+		return true
+	}
+	var statResetErr *quic.StatelessResetError
+	if errors.As(err, &statResetErr) {
+		return true
+	}
+	var transportErr *quic.TransportError
+	if errors.As(err, &transportErr) {
+		return true
+	}
+	return false
+}
+
 const (
 	quicPortOffset        = 1
 	quicIdleTimeout       = 5 * time.Minute
 	quicKeepAlive         = 30 * time.Second
 	quicDialTimeout       = 10 * time.Second
-	quicRecvBufSize = 256
+	quicRecvBufSize       = 256
+	// quicNoProgressTimeout is the maximum time a QUIC session can go without
+	// receiving any datagram or handshake stream from the peer before sendToPeer
+	// considers it stale and returns errQUICSessionClosed to trigger UDP fallback.
+	// Why: quic-go's Send* APIs succeed once the packet enters the local socket,
+	// so application-layer failures (peer not running QUIC, key mismatch, etc.)
+	// never surface as send errors. Without an independent liveness signal, the
+	// caller cannot tell that the path is dead and never falls back.
+	quicNoProgressTimeout = 5 * time.Second
+	// quicBlockDuration is how long sendToPeer refuses to re-dial QUIC for a
+	// peer after detecting a stale path. Without this, every outbound packet
+	// would dial a new session, waste another quicNoProgressTimeout window
+	// dropping packets to a dead peer, then fall back again — meaning only one
+	// packet per cycle actually reaches the peer over UDP.
+	quicBlockDuration = 30 * time.Second
 )
 
 var quicTransportEnabled = envknob.RegisterBool("TS_QUIC_TRANSPORT")
@@ -72,6 +114,15 @@ type quicTransport struct {
 
 	sessions map[key.NodePublic]*quicSession
 
+	// progressMu guards lastProgress and blockedUntil.
+	// lastProgress tracks the last time a datagram or handshake was successfully
+	// received from each peer. Used by sendToPeer to detect stale sessions.
+	// blockedUntil suppresses new QUIC dials to a peer after a stale event so
+	// that endpoint.send keeps using UDP fallback instead of cycling.
+	progressMu   sync.Mutex
+	lastProgress map[key.NodePublic]time.Time
+	blockedUntil map[key.NodePublic]time.Time
+
 	handshakeCh chan quicPacket
 	transportCh chan quicPacket
 
@@ -98,10 +149,12 @@ func newQUICTransport(c *Conn, wgPort uint16) (*quicTransport, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	qt := &quicTransport{
-		sessions:    make(map[key.NodePublic]*quicSession),
-		handshakeCh: make(chan quicPacket, quicRecvBufSize),
-		transportCh: make(chan quicPacket, quicRecvBufSize),
-		tlsConfig:   newQUICTLSConfig(),
+		sessions:     make(map[key.NodePublic]*quicSession),
+		lastProgress: make(map[key.NodePublic]time.Time),
+		blockedUntil: make(map[key.NodePublic]time.Time),
+		handshakeCh:  make(chan quicPacket, quicRecvBufSize),
+		transportCh:  make(chan quicPacket, quicRecvBufSize),
+		tlsConfig:    newQUICTLSConfig(),
 		quicConfig: &quic.Config{
 			HandshakeIdleTimeout: quicDialTimeout,
 			MaxIdleTimeout:       quicIdleTimeout,
@@ -173,6 +226,11 @@ func (qt *quicTransport) Close() {
 	qt.sessions = make(map[key.NodePublic]*quicSession)
 	qt.mu.Unlock()
 
+	qt.progressMu.Lock()
+	qt.lastProgress = make(map[key.NodePublic]time.Time)
+	qt.blockedUntil = make(map[key.NodePublic]time.Time)
+	qt.progressMu.Unlock()
+
 	if qt.listener != nil {
 		qt.listener.Close()
 	}
@@ -204,16 +262,31 @@ func (qt *quicTransport) acceptLoop() {
 		}
 
 		src := addrPort
+		qt.conn.logf("magicsock: QUIC acceptLoop from %v", src)
+
+		// Try to find endpoint by source address (adjusting for QUIC port =
+		// wgPort+1). The session MUST be bound to the peer's pubKey here:
+		// streamReader and sessionReadLoop deliver received packets to
+		// wireguard-go keyed on session.pubKey, and WireGuard handshake
+		// messages do not carry the long-term pubKey in plaintext (Initiation
+		// encrypts it, Response only has 4-byte indices), so we cannot recover
+		// the binding from the message later. If we cannot identify the peer
+		// here, the session is useless and we close it.
 		ep := qt.conn.findOrCreateEndpointForQUIC(src)
 		if ep == nil {
+			qt.conn.logf("magicsock: QUIC acceptLoop from %v: no endpoint for source (peerMap has no wgPort=%d); closing session", src, src.Port()-1)
 			conn.CloseWithError(0, "unknown peer")
 			continue
 		}
-
-		pk := ep.publicKey
+		session.pubKey = ep.publicKey
 		qt.mu.Lock()
-		qt.sessions[pk] = session
+		qt.sessions[ep.publicKey] = session
 		qt.mu.Unlock()
+		// Start the no-progress timer for this peer so sendToPeer can detect
+		// a stale path and fall back to UDP. We use seedTimer (not
+		// markProgress) because handshake completion alone doesn't prove
+		// a working data path — wait for real RX before clearing blockedUntil.
+		qt.seedTimer(ep.publicKey)
 
 		qt.wg.Add(1)
 		go qt.sessionReadLoop(session, ep)
@@ -221,6 +294,7 @@ func (qt *quicTransport) acceptLoop() {
 }
 
 func (qt *quicTransport) dialSession(pubKey key.NodePublic, addr netip.AddrPort) (*quicSession, error) {
+	qt.conn.logf("magicsock: QUIC dialSession %s -> %v", pubKey.ShortString(), addr)
 	ctx, cancel := context.WithTimeout(qt.ctx, quicDialTimeout)
 	defer cancel()
 
@@ -228,8 +302,10 @@ func (qt *quicTransport) dialSession(pubKey key.NodePublic, addr netip.AddrPort)
 	udpAddr := net.UDPAddrFromAddrPort(quicAddr)
 	conn, err := qt.qTransport.Dial(ctx, udpAddr, qt.tlsConfig, qt.quicConfig)
 	if err != nil {
+		qt.conn.logf("magicsock: QUIC dialSession %s failed: %v", pubKey.ShortString(), err)
 		return nil, err
 	}
+	qt.conn.logf("magicsock: QUIC dialSession %s -> %v connected", pubKey.ShortString(), quicAddr)
 
 	session := &quicSession{
 		conn:   conn,
@@ -240,6 +316,10 @@ func (qt *quicTransport) dialSession(pubKey key.NodePublic, addr netip.AddrPort)
 	qt.mu.Lock()
 	qt.sessions[pubKey] = session
 	qt.mu.Unlock()
+	// Start the no-progress timer on dial. If no datagram or handshake arrives
+	// within quicNoProgressTimeout, sendToPeer will tear this session down and
+	// signal endpoint.send to fall back to UDP.
+	qt.seedTimer(pubKey)
 
 	qt.wg.Add(1)
 	go qt.sessionReadLoop(session, nil)
@@ -257,15 +337,17 @@ func (qt *quicTransport) getOrCreateSession(pubKey key.NodePublic, addr netip.Ad
 
 	// Dial without holding lock; another goroutine may have created
 	// a session while we were unlocked.
+	qt.conn.logf("magicsock: QUIC getOrCreateSession dialing %s -> %v", pubKey.ShortString(), addr)
 	session, err := qt.dialSession(pubKey, addr)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check whether another goroutine created a session first.
+	// dialSession already added the session to qt.sessions[pubKey].
+	// Check whether another goroutine created a session first and
+	// if so, close our extra one.
 	qt.mu.Lock()
-	if existing, ok := qt.sessions[pubKey]; ok {
-		// Another goroutine beat us; close our session and return the existing one.
+	if existing, ok := qt.sessions[pubKey]; ok && existing != session {
 		session.Close()
 		qt.mu.Unlock()
 		return existing, nil
@@ -279,13 +361,16 @@ func (qt *quicTransport) resolveEndpointByKey(pubKey key.NodePublic) *endpoint {
 	defer qt.conn.mu.Unlock()
 	e, ok := qt.conn.peerMap.endpointForNodeKey(pubKey)
 	if !ok {
+		qt.conn.logf("magicsock: QUIC resolveEndpointByKey %s not found in peerMap", pubKey.ShortString())
 		return nil
 	}
+	qt.conn.logf("magicsock: QUIC resolveEndpointByKey %s found endpoint %s", pubKey.ShortString(), e.publicKey.ShortString())
 	return e
 }
 
 func (qt *quicTransport) sessionReadLoop(session *quicSession, ep *endpoint) {
 	defer qt.wg.Done()
+	qt.conn.logf("magicsock: QUIC sessionReadLoop start for %s", session.pubKey.ShortString())
 
 	streamCtx, streamCancel := context.WithCancel(qt.ctx)
 	defer streamCancel()
@@ -295,7 +380,8 @@ func (qt *quicTransport) sessionReadLoop(session *quicSession, ep *endpoint) {
 	for {
 		data, err := session.conn.ReceiveDatagram(qt.ctx)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+			qt.conn.logf("magicsock: QUIC sessionReadLoop %s ReceiveDatagram err: %v", session.pubKey.ShortString(), err)
+			if isQUICClosingErr(err) {
 				return
 			}
 			select {
@@ -308,6 +394,7 @@ func (qt *quicTransport) sessionReadLoop(session *quicSession, ep *endpoint) {
 
 		msg := make([]byte, len(data))
 		copy(msg, data)
+		qt.conn.logf("magicsock: QUIC sessionReadLoop %s received datagram len=%d", session.pubKey.ShortString(), len(msg))
 
 		if ep == nil {
 			ep = qt.resolveEndpointByKey(session.pubKey)
@@ -319,17 +406,22 @@ func (qt *quicTransport) sessionReadLoop(session *quicSession, ep *endpoint) {
 		pkt := quicPacket{data: msg, ep: ep}
 		select {
 		case qt.transportCh <- pkt:
+			qt.markProgress(session.pubKey)
+			qt.conn.logf("magicsock: QUIC sessionReadLoop %s sent to transportCh", session.pubKey.ShortString())
 		default:
 			qt.droppedTransports.Add(1)
+			qt.conn.logf("magicsock: QUIC sessionReadLoop %s transportCh full, dropping", session.pubKey.ShortString())
 			qt.logFirstDrop()
 		}
 	}
 }
 
 func (qt *quicTransport) streamReader(session *quicSession, ctx context.Context, ep *endpoint) {
+	qt.conn.logf("magicsock: QUIC streamReader start for %s", session.pubKey.ShortString())
 	for {
 		stream, err := session.conn.AcceptUniStream(ctx)
 		if err != nil {
+			qt.conn.logf("magicsock: QUIC streamReader %s AcceptUniStream err: %v", session.pubKey.ShortString(), err)
 			return
 		}
 
@@ -340,22 +432,41 @@ func (qt *quicTransport) streamReader(session *quicSession, ctx context.Context,
 			if err != nil || len(data) == 0 {
 				return
 			}
+			qt.conn.logf("magicsock: QUIC streamReader %s received stream len=%d", session.pubKey.ShortString(), len(data))
 
 			msg := make([]byte, len(data))
 			copy(msg, data)
+			qt.conn.logf("magicsock: QUIC streamReader %s raw msg bytes: %x", session.pubKey.ShortString(), msg[:min(32, len(msg))])
+
+			// We previously tried to recover the peer's long-term pubKey from
+			// the WireGuard message contents, but that is fundamentally
+			// impossible: Initiation's Static field is ChaCha20Poly1305
+			// ciphertext, and Response's only fixed fields are 4-byte sender/
+			// receiver indices — neither carries the 32-byte pubKey. The
+			// session MUST be bound to the right pubKey at accept/dial time
+			// (see acceptLoop and dialSession); if it isn't, we have no way
+			// to deliver the packet, so drop it.
+			if session.pubKey.IsZero() {
+				qt.conn.logf("magicsock: QUIC streamReader dropping msg type=%d len=%d: session has no pubKey binding", msg[0], len(msg))
+				return
+			}
 
 			currentEP := ep
 			if currentEP == nil {
 				currentEP = qt.resolveEndpointByKey(session.pubKey)
 			}
 			if currentEP == nil {
+				qt.conn.logf("magicsock: QUIC streamReader %s cannot resolve endpoint (msg type %d); dropping", session.pubKey.ShortString(), msg[0])
 				return
 			}
 
 			select {
 			case qt.handshakeCh <- quicPacket{data: msg, ep: currentEP}:
+				qt.markProgress(session.pubKey)
+				qt.conn.logf("magicsock: QUIC streamReader %s sent to handshakeCh", session.pubKey.ShortString())
 			default:
 				qt.droppedHandshakes.Add(1)
+				qt.conn.logf("magicsock: QUIC streamReader %s handshakeCh full, dropping", session.pubKey.ShortString())
 				qt.logFirstDrop()
 			}
 		}(stream)
@@ -363,8 +474,38 @@ func (qt *quicTransport) streamReader(session *quicSession, ctx context.Context,
 }
 
 func (qt *quicTransport) sendToPeer(pubKey key.NodePublic, wgAddr netip.AddrPort, buffs [][]byte, offset int) error {
+	qt.conn.logf("magicsock: QUIC sendToPeer %s -> %v, %d buffers", pubKey.ShortString(), wgAddr, len(buffs))
+
+	// Fast path: if we recently marked this peer's QUIC path as dead, skip
+	// dialing entirely and let endpoint.send fall back to UDP. Without this,
+	// every outbound packet would trigger a fresh dial + 5s grace window of
+	// silently dropped packets before the next stale-trigger fired.
+	if qt.isBlocked(pubKey) {
+		qt.conn.logf("magicsock: QUIC sendToPeer %s blocked; returning errQUICSessionClosed", pubKey.ShortString())
+		return errQUICSessionClosed
+	}
+
+	// Detect a stale session before reusing it. quic-go reports success the
+	// moment a packet enters the local socket, so application-layer failures
+	// (peer not running QUIC, key mismatch, etc.) never surface as send errors.
+	// If we've sent into this session but received nothing back for longer than
+	// quicNoProgressTimeout, treat the path as dead, tear it down, mark the
+	// peer blocked, and signal endpoint.send to fall back to UDP via
+	// errQUICSessionClosed.
+	qt.mu.Lock()
+	if s, ok := qt.sessions[pubKey]; ok && qt.isStale(pubKey) {
+		delete(qt.sessions, pubKey)
+		qt.mu.Unlock()
+		qt.markBlocked(pubKey)
+		s.Close()
+		qt.conn.logf("magicsock: QUIC sendToPeer %s session stale (no rx for >%v); marking blocked for %v, falling back to UDP", pubKey.ShortString(), quicNoProgressTimeout, quicBlockDuration)
+		return errQUICSessionClosed
+	}
+	qt.mu.Unlock()
+
 	session, err := qt.getOrCreateSession(pubKey, wgAddr)
 	if err != nil {
+		qt.conn.logf("magicsock: QUIC sendToPeer getOrCreateSession failed: %v", err)
 		return err
 	}
 
@@ -373,8 +514,11 @@ func (qt *quicTransport) sendToPeer(pubKey key.NodePublic, wgAddr netip.AddrPort
 		qt.mu.Lock()
 		delete(qt.sessions, pubKey)
 		qt.mu.Unlock()
+		qt.conn.logf("magicsock: QUIC sendToPeer session closed, waiting before re-dial")
+		time.Sleep(500 * time.Millisecond) // Wait for peer to set up endpoint
 		session, err = qt.dialSession(pubKey, wgAddr)
 		if err != nil {
+			qt.conn.logf("magicsock: QUIC sendToPeer re-dial failed: %v", err)
 			return err
 		}
 	default:
@@ -393,17 +537,99 @@ func (qt *quicTransport) sendToPeer(pubKey key.NodePublic, wgAddr netip.AddrPort
 
 		switch {
 		case msgType >= conn.MessageInitiationType && msgType <= conn.MessageCookieReplyType:
+			qt.conn.logf("magicsock: QUIC sendToPeer %s sending handshake (type=%d)", pubKey.ShortString(), msgType)
 			if err := qt.sendHandshake(session, msg); err != nil {
+				qt.conn.logf("magicsock: QUIC sendToPeer handshake failed: %v", err)
 				return err
 			}
 		case msgType == conn.MessageTransportType:
+			qt.conn.logf("magicsock: QUIC sendToPeer %s sending datagram (type=%d, len=%d)", pubKey.ShortString(), msgType, len(msg))
 			if err := session.conn.SendDatagram(msg); err != nil {
+				qt.conn.logf("magicsock: QUIC sendToPeer datagram failed: %v", err)
 				return err
 			}
 		}
 	}
 
 	return nil
+}
+
+// markProgress records that a real datagram or handshake stream was received
+// from pubKey. It refreshes the no-progress timer and clears any QUIC-block on
+// pubKey (real RX is proof that the path is alive again).
+func (qt *quicTransport) markProgress(pubKey key.NodePublic) {
+	if pubKey.IsZero() {
+		return
+	}
+	qt.progressMu.Lock()
+	qt.lastProgress[pubKey] = time.Now()
+	delete(qt.blockedUntil, pubKey)
+	qt.progressMu.Unlock()
+}
+
+// seedTimer starts the no-progress timer for pubKey at "now". Called when a
+// session is established (dial or accept). Unlike markProgress, this does NOT
+// clear blockedUntil — session establishment alone does not prove a working
+// data path.
+func (qt *quicTransport) seedTimer(pubKey key.NodePublic) {
+	if pubKey.IsZero() {
+		return
+	}
+	qt.progressMu.Lock()
+	qt.lastProgress[pubKey] = time.Now()
+	qt.progressMu.Unlock()
+}
+
+// markBlocked records that pubKey's QUIC path is dead. Subsequent sendToPeer
+// calls will short-circuit to errQUICSessionClosed until quicBlockDuration has
+// elapsed. Also clears lastProgress so a future re-dial starts with a fresh
+// grace period.
+func (qt *quicTransport) markBlocked(pubKey key.NodePublic) {
+	if pubKey.IsZero() {
+		return
+	}
+	qt.progressMu.Lock()
+	qt.blockedUntil[pubKey] = time.Now().Add(quicBlockDuration)
+	delete(qt.lastProgress, pubKey)
+	qt.progressMu.Unlock()
+}
+
+// isBlocked reports whether pubKey is currently in a QUIC fallback window.
+// Expired entries are cleaned up opportunistically.
+func (qt *quicTransport) isBlocked(pubKey key.NodePublic) bool {
+	qt.progressMu.Lock()
+	defer qt.progressMu.Unlock()
+	t, ok := qt.blockedUntil[pubKey]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(t) {
+		return true
+	}
+	delete(qt.blockedUntil, pubKey)
+	return false
+}
+
+// isStale reports whether the most recent successful receive from pubKey is
+// older than quicNoProgressTimeout. Returns false if no progress has ever been
+// recorded.
+func (qt *quicTransport) isStale(pubKey key.NodePublic) bool {
+	qt.progressMu.Lock()
+	defer qt.progressMu.Unlock()
+	t, ok := qt.lastProgress[pubKey]
+	if !ok {
+		return false
+	}
+	return time.Since(t) > quicNoProgressTimeout
+}
+
+// clearProgress removes any progress/block entries for pubKey. Called when a
+// peer leaves the netmap.
+func (qt *quicTransport) clearProgress(pubKey key.NodePublic) {
+	qt.progressMu.Lock()
+	delete(qt.lastProgress, pubKey)
+	delete(qt.blockedUntil, pubKey)
+	qt.progressMu.Unlock()
 }
 
 // RemovePeerSessions closes and removes QUIC sessions for peers not in the
@@ -413,14 +639,22 @@ func (qt *quicTransport) RemovePeerSessions(keep set.Set[key.NodePublic]) {
 		return
 	}
 	var toClose []*quicSession
+	var removedKeys []key.NodePublic
 	qt.mu.Lock()
 	for pk, s := range qt.sessions {
 		if !keep.Contains(pk) {
 			delete(qt.sessions, pk)
 			toClose = append(toClose, s)
+			removedKeys = append(removedKeys, pk)
 		}
 	}
 	qt.mu.Unlock()
+	qt.progressMu.Lock()
+	for _, pk := range removedKeys {
+		delete(qt.lastProgress, pk)
+		delete(qt.blockedUntil, pk)
+	}
+	qt.progressMu.Unlock()
 	for _, s := range toClose {
 		s.Close()
 	}
@@ -437,6 +671,7 @@ func (qt *quicTransport) RemovePeerByKey(pk key.NodePublic) {
 		delete(qt.sessions, pk)
 	}
 	qt.mu.Unlock()
+	qt.clearProgress(pk)
 	if ok {
 		s.Close()
 	}
@@ -473,6 +708,11 @@ func (qt *quicTransport) Rebind(wgPort uint16) {
 	}
 	qt.sessions = make(map[key.NodePublic]*quicSession)
 	qt.mu.Unlock()
+
+	qt.progressMu.Lock()
+	qt.lastProgress = make(map[key.NodePublic]time.Time)
+	qt.blockedUntil = make(map[key.NodePublic]time.Time)
+	qt.progressMu.Unlock()
 
 	for _, s := range sessions {
 		s.Close()

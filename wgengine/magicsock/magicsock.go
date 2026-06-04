@@ -3837,12 +3837,19 @@ func (c *Conn) resetEndpointStates() {
 	})
 }
 
-// findOrCreateEndpointForQUIC looks up or creates an endpoint for QUIC connections.
-// It returns nil if no endpoint is known for the given address.
+// findOrCreateEndpointForQUIC looks up the endpoint that owns a QUIC source
+// address. The QUIC listener binds to wgPort+1, so the peer's source port seen
+// here is wgPort+1, not the wgPort the endpoint is registered with — we adjust
+// before looking up.
 func (c *Conn) findOrCreateEndpointForQUIC(src netip.AddrPort) *endpoint {
+	wgPort := uint16(0)
+	if src.Port() > 0 {
+		wgPort = src.Port() - 1
+	}
+	wgAddr := netip.AddrPortFrom(src.Addr(), wgPort)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	ep, ok := c.peerMap.endpointForEpAddr(epAddr{ap: src})
+	ep, ok := c.peerMap.endpointForEpAddr(epAddr{ap: wgAddr})
 	if !ok {
 		return nil
 	}
