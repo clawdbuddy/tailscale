@@ -303,6 +303,13 @@ func (qt *quicTransport) dialSession(pubKey key.NodePublic, addr netip.AddrPort)
 	conn, err := qt.qTransport.Dial(ctx, udpAddr, qt.tlsConfig, qt.quicConfig)
 	if err != nil {
 		qt.conn.logf("magicsock: QUIC dialSession %s failed: %v", pubKey.ShortString(), err)
+		// Mark the peer blocked so the next sendToPeer call short-circuits
+		// to errQUICSessionClosed for quicBlockDuration, letting endpoint.send
+		// fall back to UDP without burning another 5s dial attempt per packet.
+		// Without this, a peer whose address is unreachable (e.g. IPv6 privacy
+		// extension rotation, NAT rebind, peer not actually listening on QUIC)
+		// traps us in a tight dial-fail loop.
+		qt.markBlocked(pubKey)
 		return nil, err
 	}
 	qt.conn.logf("magicsock: QUIC dialSession %s -> %v connected", pubKey.ShortString(), quicAddr)
