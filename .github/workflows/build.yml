@@ -95,11 +95,16 @@ jobs:
 
       - name: Package .zip (macOS/Windows)
         if: matrix.pkg == 'zip'
+        env:
+          # Match the deb filename convention (no leading 'v') so release
+          # artifacts use a consistent version.
+          VERSION_SHORT: ${{ env.VERSION }}
         run: |
+          ZIP_VERSION="${VERSION_SHORT#v}"
           mkdir -p tailscale-zip
           cp tailscale${{ matrix.ext }} tailscale-zip/
           cp tailscaled${{ matrix.ext }} tailscale-zip/
-          zip -j tailscale_${{ env.VERSION }}_${{ matrix.name }}.zip tailscale-zip/*
+          zip -j tailscale_${ZIP_VERSION}_${{ matrix.name }}.zip tailscale-zip/*
 
       - uses: actions/upload-artifact@v4
         with:
@@ -107,7 +112,7 @@ jobs:
           path: |
             tailscale${{ matrix.ext }}
             tailscaled${{ matrix.ext }}
-            tailscale_${{ env.VERSION }}_${{ matrix.name }}.*
+            tailscale_*_${{ matrix.name }}.*
           retention-days: 7
 
   create-release:
