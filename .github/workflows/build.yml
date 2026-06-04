@@ -66,13 +66,18 @@ jobs:
 
       - name: Package .deb (Linux)
         if: matrix.pkg == 'deb'
+        env:
+          # dpkg-deb requires the Version field to start with a digit.
+          VERSION_DEB: ${{ env.VERSION }}
         run: |
+          # Strip leading 'v' for the deb Version field if present.
+          DEB_VERSION="${VERSION_DEB#v}"
           mkdir -p tailscale-deb/DEBIAN
           mkdir -p tailscale-deb/usr/bin
           mkdir -p tailscale-deb/lib/systemd/system
-          cat > tailscale-deb/DEBIAN/control << 'EOF'
+          cat > tailscale-deb/DEBIAN/control << EOF
           Package: tailscale
-          Version: ${{ env.VERSION }}
+          Version: ${DEB_VERSION}
           Section: net
           Priority: optional
           Architecture: ${{ matrix.goarch }}
@@ -86,7 +91,7 @@ jobs:
           cp tailscale tailscale-deb/usr/bin/
           cp tailscaled tailscale-deb/usr/bin/
           cp cmd/tailscaled/tailscaled.service tailscale-deb/lib/systemd/system/
-          dpkg-deb --build tailscale-deb tailscale_${{ env.VERSION }}_${{ matrix.name }}.deb
+          dpkg-deb --build tailscale-deb tailscale_${DEB_VERSION}_${{ matrix.name }}.deb
 
       - name: Package .zip (macOS/Windows)
         if: matrix.pkg == 'zip'
