@@ -1630,6 +1630,20 @@ func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.T
 		lastGotPingTxID: forRxPingTxID,
 	}
 
+	// QUIC-prefer: if QUIC transport is enabled and we don't have a bestAddr
+	// yet, promote this freshly-discovered candidate so the next packet to the
+	// peer will take the qt.sendToPeer path (which dials QUIC at ep.Port()+1).
+	// If the dial fails, the existing markBlocked → sendUDPBatch → DERP
+	// fallback chain handles it. If a disco pong later confirms the address,
+	// handlePongConnLocked overwrites bestAddr.
+	if de.c.quicTransport != nil && de.c.quicTransport.Enabled() &&
+		!de.bestAddr.epAddr.ap.IsValid() {
+		de.setBestAddrLocked(addrQuality{epAddr: epAddr{ap: ep}})
+		de.trustBestAddrUntil = mono.Now().Add(30 * time.Second)
+		de.c.logf("magicsock: promoted STUN candidate %v to bestAddr for QUIC dial (peer %s)",
+			ep, de.publicKey.ShortString())
+	}
+
 	// If for some reason this gets very large, do some cleanup.
 	if size := len(de.endpointState); size > 100 {
 		for ep, st := range de.endpointState {
